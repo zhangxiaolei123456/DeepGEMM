@@ -40,7 +40,7 @@ public:
 #include <deep_gemm/impls/sm90_mxfp8_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
-static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 9;
+static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 8;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_mxfp8_fp8_gemm_1d2d_impl<
@@ -183,7 +183,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<false>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v9", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v8", code);
     SM90MXFP8FP8Gemm1D2DRuntime<false>::launch(runtime, args);
 }
 
@@ -269,7 +269,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<true>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v9", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v8", code);
     SM90MXFP8FP8Gemm1D2DRuntime<true>::launch(runtime, args);
 }
 
