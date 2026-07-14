@@ -499,3 +499,105 @@ def test_m_grouped_mxfp8_vs_fp8_perf_contiguous_and_masked():
     assert fp8_masked_elapsed > 0
     assert contiguous_diff == contiguous_diff
     assert masked_diff == masked_diff
+
+
+def test_m_grouped_mxfp8_fp8_contiguous_perf_large_m_scaling():
+    _require_sm90()
+    torch.manual_seed(2)
+
+    groups, n, k = 4, 1024, 1024
+    cases = [
+        ("small_m", 128),
+        ("large_m", 2048),
+    ]
+    rows = []
+
+    for case_name, m_per_group in cases:
+        m = groups * m_per_group
+        a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+        b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
+
+        a_mx_data, a_mx_sf_fp32 = per_token_cast_to_fp8(
+            a_ref, use_ue8m0=True, gran_k=32
+        )
+        a_mx = (a_mx_data, _e8m0_from_fp32_pow2(a_mx_sf_fp32))
+        a_fp8 = per_token_cast_to_fp8(a_ref, use_ue8m0=False, gran_k=128)
+        grouped_layout = torch.arange(groups, device="cuda", dtype=torch.int32).repeat_interleave(
+            m_per_group
+        )
+
+        b_mx_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+        b_mx_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
+        b_fp8_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+        b_fp8_sf = torch.empty((groups, n, k // 128), device="cuda", dtype=torch.float32)
+        for group_id in range(groups):
+            b_mx_data[group_id], b_mx_sf_fp32[group_id] = per_token_cast_to_fp8(
+                b_ref[group_id], use_ue8m0=True, gran_k=32
+            )
+            b_fp8_data[group_id], b_fp8_sf[group_id] = per_token_cast_to_fp8(
+                b_ref[group_id], use_ue8m0=False, gran_k=128
+            )
+        b_mx = (b_mx_data, _e8m0_from_fp32_pow2(b_mx_sf_fp32))
+        b_fp8 = (b_fp8_data, b_fp8_sf)
+        d_mx = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        d_fp8 = torch.empty_like(d_mx)
+
+        def run_mx_contiguous():
+            deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
+                a_mx, b_mx, d_mx, grouped_layout
+            )
+
+        def run_fp8_contiguous():
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                a_fp8,
+                b_fp8,
+                d_fp8,
+                grouped_layout,
+                recipe_a=(1, 128),
+                recipe_b=(1, 128),
+            )
+
+        mx_elapsed = _time_kernel(run_mx_contiguous)
+        fp8_elapsed = _time_kernel(run_fp8_contiguous)
+        speedup = fp8_elapsed / mx_elapsed
+        rows.append(
+            {
+                "case_name": case_name,
+                "m": m,
+                "mx_elapsed": mx_elapsed,
+                "fp8_elapsed": fp8_elapsed,
+                "mx_tflops": _tflops(m, n, k, mx_elapsed),
+                "fp8_tflops": _tflops(m, n, k, fp8_elapsed),
+                "speedup": speedup,
+            }
+        )
+
+        assert mx_elapsed > 0
+        assert fp8_elapsed > 0
+        assert speedup == speedup
+
+    print("case | M | MXFP8 us | FP8 us | MXFP8 TFLOPS | FP8 TFLOPS | speedup")
+    print("-- | -- | -- | -- | -- | -- | --")
+    for row in rows:
+        print(
+            f"{row['case_name']} | {row['m']} | "
+            f"{row['mx_elapsed'] * 1e6:.0f} | {row['fp8_elapsed'] * 1e6:.0f} | "
+            f"{row['mx_tflops']:.1f} | {row['fp8_tflops']:.1f} | "
+            f"{row['speedup']:.2f}x"
+        )
+
+    large_m_row = rows[-1]
+    print(
+        "When m increases, contiguous kernel performance is poor; "
+        f"at m = {large_m_row['m']}, MXFP8 contiguous is "
+        f"{large_m_row['mx_elapsed'] * 1e6:.0f} us versus FP8 contiguous "
+        f"{large_m_row['fp8_elapsed'] * 1e6:.0f} us -- only "
+        f"{large_m_row['speedup']:.2f}x the speed."
+    )
+    assert large_m_row["m"] == 8192
+    assert large_m_row["speedup"] >= 0.25, (
+        "MXFP8 contiguous kernel regressed badly at m=8192: "
+        f"{large_m_row['mx_elapsed'] * 1e6:.0f} us vs "
+        f"{large_m_row['fp8_elapsed'] * 1e6:.0f} us, "
+        f"speedup={large_m_row['speedup']:.2f}x"
+    )
