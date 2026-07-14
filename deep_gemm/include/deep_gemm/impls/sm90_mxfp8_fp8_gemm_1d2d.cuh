@@ -38,6 +38,38 @@ CUTLASS_DEVICE uint8_t load_e8m0_scale(const void* ptr, uint32_t base_offset,
     return reinterpret_cast<const uint8_t*>(ptr)[base_offset + k_scale_idx * stride_k];
 }
 
+CUTLASS_DEVICE uint32_t load_e8m0_scale_quad(const void* ptr, uint32_t base_offset,
+                                             uint32_t k_block_idx, uint32_t stride_k,
+                                             uint32_t gran_k, bool packed_int32,
+                                             uint32_t shape_k) {
+    constexpr uint32_t kIdentityScalePack = 0x7f7f7f7f;
+    const uint32_t first_k_scale_idx = (k_block_idx * 128) / gran_k;
+    const uint32_t first_k = k_block_idx * 128;
+
+    if (first_k >= shape_k)
+        return kIdentityScalePack;
+
+    if (gran_k == 32 and first_k + 128 <= shape_k) {
+        if (packed_int32 and stride_k == 1)
+            return reinterpret_cast<const uint32_t*>(ptr)[base_offset + first_k_scale_idx / 4];
+        if (not packed_int32 and stride_k == 1 and base_offset % 4 == 0)
+            return *reinterpret_cast<const uint32_t*>(
+                reinterpret_cast<const uint8_t*>(ptr) + base_offset + first_k_scale_idx);
+    }
+
+    uint32_t packed = 0;
+    #pragma unroll
+    for (uint32_t kk = 0; kk < 4; ++ kk) {
+        const uint32_t k = first_k + kk * 32;
+        const uint32_t k_scale_idx = k / gran_k;
+        const uint8_t scale = k < shape_k ?
+            load_e8m0_scale(ptr, base_offset, k_scale_idx, stride_k, packed_int32) :
+            static_cast<uint8_t>(127);
+        packed |= static_cast<uint32_t>(scale) << (kk * 8);
+    }
+    return packed;
+}
+
 } // namespace mxfp8_fp8_detail
 
 template <bool kMasked,
@@ -166,39 +198,36 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                     }
 
                     const uint32_t sfa_base_m = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
-                    for (uint32_t i = lane_idx; i < BLOCK_M * SHAPE_K_SFA_PER_STAGE; i += 32) {
-                        const uint32_t m_offset = i / SHAPE_K_SFA_PER_STAGE;
-                        const uint32_t k_scale_offset = i % SHAPE_K_SFA_PER_STAGE;
+                    for (uint32_t m_offset = lane_idx; m_offset < BLOCK_M; m_offset += 32) {
                         const uint32_t m_idx = sfa_base_m + m_offset;
-                        const uint32_t k_idx_for_scale = k_block_idx * BLOCK_K + k_scale_offset * 32;
-                        const uint32_t k_scale_idx = k_idx_for_scale / sfa_gran_k;
-                        const bool is_valid = m_idx < shape_m * (kMasked ? kNumGroups : 1) and
-                                              k_idx_for_scale < shape_k;
+                        const bool is_valid = m_idx < shape_m * (kMasked ? kNumGroups : 1);
                         const uint32_t sfa_local_m = kMasked ? (m_idx - scheduler.current_group_idx * shape_m) : m_idx;
                         const uint32_t sfa_base_offset = (kMasked ? scheduler.current_group_idx * sfa_stride_group : 0) +
                                                          sfa_local_m * sfa_stride_m;
-                        smem_sfa[stage_idx][i] = is_valid ?
-                            mxfp8_fp8_detail::load_e8m0_scale(
-                                sfa, sfa_base_offset, k_scale_idx, sfa_stride_k, sfa_packed_int32) :
-                            static_cast<uint8_t>(127);
+                        const uint32_t scales = is_valid ?
+                            mxfp8_fp8_detail::load_e8m0_scale_quad(
+                                sfa, sfa_base_offset, k_block_idx, sfa_stride_k,
+                                sfa_gran_k, sfa_packed_int32, shape_k) :
+                            0x7f7f7f7f;
+                        *reinterpret_cast<uint32_t*>(
+                            smem_sfa[stage_idx] + m_offset * SHAPE_K_SFA_PER_STAGE) = scales;
                     }
 
-                    for (uint32_t i = lane_idx; i < BLOCK_N * SHAPE_K_SFB_PER_STAGE; i += 32) {
-                        const uint32_t n_offset = i / SHAPE_K_SFB_PER_STAGE;
-                        const uint32_t k_scale_offset = i % SHAPE_K_SFB_PER_STAGE;
+                    const uint32_t sfb_group_idx = kMasked ?
+                        scheduler.current_group_idx :
+                        static_cast<uint32_t>(cute::max(0, grouped_layout[m_block_idx * BLOCK_M]));
+                    for (uint32_t n_offset = lane_idx; n_offset < BLOCK_N; n_offset += 32) {
                         const uint32_t n_idx = n_block_idx * BLOCK_N + n_offset;
-                        const uint32_t k_idx_for_scale = k_block_idx * BLOCK_K + k_scale_offset * 32;
-                        const uint32_t k_scale_idx = k_idx_for_scale / sfb_gran_k;
-                        const bool is_valid = n_idx < shape_n and k_idx_for_scale < shape_k;
-                        const uint32_t sfb_group_idx = kMasked ?
-                            scheduler.current_group_idx :
-                            static_cast<uint32_t>(cute::max(0, grouped_layout[m_block_idx * BLOCK_M]));
+                        const bool is_valid = n_idx < shape_n;
                         const uint32_t sfb_base_offset = sfb_group_idx * sfb_stride_group +
                                                          n_idx * sfb_stride_n;
-                        smem_sfb[stage_idx][i] = is_valid ?
-                            mxfp8_fp8_detail::load_e8m0_scale(
-                                sfb, sfb_base_offset, k_scale_idx, sfb_stride_k, sfb_packed_int32) :
-                            static_cast<uint8_t>(127);
+                        const uint32_t scales = is_valid ?
+                            mxfp8_fp8_detail::load_e8m0_scale_quad(
+                                sfb, sfb_base_offset, k_block_idx, sfb_stride_k,
+                                sfb_gran_k, sfb_packed_int32, shape_k) :
+                            0x7f7f7f7f;
+                        *reinterpret_cast<uint32_t*>(
+                            smem_sfb[stage_idx] + n_offset * SHAPE_K_SFB_PER_STAGE) = scales;
                     }
                     __threadfence_block();
                     __syncwarp();
@@ -227,7 +256,9 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
-            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
+            DG_STATIC_ASSERT(BLOCK_K / WGMMA::K == 4, "MXFP8 pairwise WGMMA promotion assumes four K/32 chunks");
+            float accum[WGMMA::kNumAccum], accum_1[WGMMA::kNumAccum],
+                  final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
 
             DG_STATIC_ASSERT(BLOCK_M >= 64 or kNumMathThreads == 128, "Only one math warp group for BLOCK_M < 64");
             constexpr uint32_t kNumWGMMAStoreThreads = WAVE_BLOCK_M * (128 / WGMMA::M);
@@ -276,18 +307,25 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                         }
 
                         #pragma unroll
-                        for (uint32_t kk = 0; kk < BLOCK_K / WGMMA::K; ++ kk) {
+                        for (uint32_t kk = 0; kk < BLOCK_K / WGMMA::K; kk += 2) {
                             #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i) {
                                 ptx::warpgroup_fence_operand(accum[i]);
+                                ptx::warpgroup_fence_operand(accum_1[i]);
+                            }
                             ptx::warpgroup_arrive();
                             a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + kk * WGMMA::K) / 16;
                             b_desc.reg32_[0] = b_desc_base_lo + kk * WGMMA::K / 16;
                             WGMMA::wgmma(a_desc, b_desc, accum, false);
+                            a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + (kk + 1) * WGMMA::K) / 16;
+                            b_desc.reg32_[0] = b_desc_base_lo + (kk + 1) * WGMMA::K / 16;
+                            WGMMA::wgmma(a_desc, b_desc, accum_1, false);
                             ptx::warpgroup_commit_batch();
                             #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i) {
                                 ptx::warpgroup_fence_operand(accum[i]);
+                                ptx::warpgroup_fence_operand(accum_1[i]);
+                            }
                             ptx::warpgroup_wait<0>();
 
                             if (not do_wgmma_store)
@@ -297,6 +335,10 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                                 static_cast<uint8_t>((sfa_pack_0 >> (kk * 8)) & 0xff));
                             const float scale_a_1 = mxfp8_fp8_detail::e8m0_to_float(
                                 static_cast<uint8_t>((sfa_pack_1 >> (kk * 8)) & 0xff));
+                            const float scale_a_next_0 = mxfp8_fp8_detail::e8m0_to_float(
+                                static_cast<uint8_t>((sfa_pack_0 >> ((kk + 1) * 8)) & 0xff));
+                            const float scale_a_next_1 = mxfp8_fp8_detail::e8m0_to_float(
+                                static_cast<uint8_t>((sfa_pack_1 >> ((kk + 1) * 8)) & 0xff));
                             auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
@@ -304,10 +346,18 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                                     static_cast<uint8_t>((sfb_pack[i][0] >> (kk * 8)) & 0xff));
                                 const float scale_b_1 = mxfp8_fp8_detail::e8m0_to_float(
                                     static_cast<uint8_t>((sfb_pack[i][1] >> (kk * 8)) & 0xff));
+                                const float scale_b_next_0 = mxfp8_fp8_detail::e8m0_to_float(
+                                    static_cast<uint8_t>((sfb_pack[i][0] >> ((kk + 1) * 8)) & 0xff));
+                                const float scale_b_next_1 = mxfp8_fp8_detail::e8m0_to_float(
+                                    static_cast<uint8_t>((sfb_pack[i][1] >> ((kk + 1) * 8)) & 0xff));
                                 shifted_accum[i * 4 + 0] += scale_a_0 * scale_b_0 * accum[i * 4 + 0];
                                 shifted_accum[i * 4 + 1] += scale_a_0 * scale_b_1 * accum[i * 4 + 1];
                                 shifted_accum[i * 4 + 2] += scale_a_1 * scale_b_0 * accum[i * 4 + 2];
                                 shifted_accum[i * 4 + 3] += scale_a_1 * scale_b_1 * accum[i * 4 + 3];
+                                shifted_accum[i * 4 + 0] += scale_a_next_0 * scale_b_next_0 * accum_1[i * 4 + 0];
+                                shifted_accum[i * 4 + 1] += scale_a_next_0 * scale_b_next_1 * accum_1[i * 4 + 1];
+                                shifted_accum[i * 4 + 2] += scale_a_next_1 * scale_b_next_0 * accum_1[i * 4 + 2];
+                                shifted_accum[i * 4 + 3] += scale_a_next_1 * scale_b_next_1 * accum_1[i * 4 + 3];
                             }
                         }
 
