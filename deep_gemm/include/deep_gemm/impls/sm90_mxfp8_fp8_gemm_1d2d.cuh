@@ -261,15 +261,26 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
-            // MXFP8 promotes each 32-wide K chunk with its own scale, so unlike FP8 we cannot
-            // hardware-accumulate across chunks: each WGMMA must be drained before its FP32
-            // promotion. When the accumulator is small enough to double-buffer without spilling
-            // (BLOCK_N <= 96 => kNumAccum <= 48) and every math warp stores (BLOCK_M >= WGMMA::M,
-            // so `do_wgmma_store` is warpgroup-uniform and the WGMMA stays collective), run a
-            // 2-deep software pipeline that overlaps chunk kk's WGMMA with chunk kk-1's promotion.
-            // Otherwise fall back to the serial single-buffer path to stay under the 232-register
-            // budget (a second full-width accumulator at BLOCK_N=128 spills to local memory).
-            constexpr bool kPipelinePromotion = WGMMA::kNumAccum <= 48 and BLOCK_M >= WGMMA::M;
+            // MXFP8 promotes each 32-wide K chunk with its own UE8M0 scale, so unlike FP8 it
+            // cannot hardware-accumulate the 4 chunks of a 128-K block into one accumulator:
+            // every WGMMA must be drained before its FP32 promotion. To hide that drain we run a
+            // software pipeline whose depth is bounded by the FP32 register budget. We reserve
+            // ~168 of the 232 math registers for accumulators (the rest cover scales, descriptors
+            // and indices) and pick the deepest form that fits at compile time:
+            //   * kFullPipeline    - one independent accumulator per chunk; all WGMMAs are issued
+            //                        back-to-back and drained once (mirrors FP8's full pipeline);
+            //   * kTwoDeepPipeline - 2-deep ping-pong overlapping chunk kk's WGMMA with kk-1's
+            //                        promotion (used when only two accumulators fit);
+            //   * otherwise        - serial single-buffer fallback (no spill).
+            // All pipelined paths require BLOCK_M >= WGMMA::M so `do_wgmma_store` is warpgroup-
+            // uniform and the collective WGMMA is always issued.
+            constexpr uint32_t kNumKChunks = BLOCK_K / WGMMA::K;
+            constexpr uint32_t kPromoteWaves = BLOCK_M / WAVE_BLOCK_M;
+            constexpr uint32_t kAccumRegBudget = 168;
+            constexpr bool kFullPipeline = BLOCK_M >= WGMMA::M and
+                (kNumKChunks + kPromoteWaves) * WGMMA::kNumAccum <= kAccumRegBudget;
+            constexpr bool kTwoDeepPipeline = BLOCK_M >= WGMMA::M and not kFullPipeline and
+                (2 + kPromoteWaves) * WGMMA::kNumAccum <= kAccumRegBudget;
             float final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
 
             DG_STATIC_ASSERT(BLOCK_M >= 64 or kNumMathThreads == 128, "Only one math warp group for BLOCK_M < 64");
@@ -339,56 +350,81 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                             }
                         };
 
-                        if constexpr (kPipelinePromotion) {
-                            // 2-deep software pipeline: overlap chunk (kk+1)'s WGMMA with chunk kk's
-                            // FP32 promotion using a ping-pong accumulator. Enabled only when the
-                            // accumulator is small (kNumAccum <= 48, guaranteed by the MXFP8 BLOCK_N
-                            // clamp) so both buffers fit under the 232-register budget.
-                            constexpr uint32_t kNumChunks = BLOCK_K / WGMMA::K;
-                            float accum_buf[2][WGMMA::kNumAccum];
+                        // Issue one 32-K chunk's collective WGMMA into accumulator `dst`.
+                        auto issue_chunk = [&](float* dst, const uint32_t& kk) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                ptx::warpgroup_fence_operand(dst[i]);
+                            ptx::warpgroup_arrive();
+                            a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + kk * WGMMA::K) / 16;
+                            b_desc.reg32_[0] = b_desc_base_lo + kk * WGMMA::K / 16;
+                            WGMMA::wgmma(a_desc, b_desc, dst, false);
+                            ptx::warpgroup_commit_batch();
+                        };
 
-                            auto issue_chunk = [&](float* dst, const uint32_t& kk) {
+                        if constexpr (kFullPipeline) {
+                            // Full pipeline: one dedicated accumulator per chunk. Issue every
+                            // WGMMA back-to-back as a single warpgroup batch and drain once
+                            // (`warpgroup_wait<0>`), matching FP8's fully-loaded tensor pipeline,
+                            // then promote each chunk with its own scale. Fits only when
+                            // kNumKChunks accumulators (+ the final_accum wave) stay under the
+                            // register budget (BLOCK_N <= 64 => kNumAccum 32).
+                            float accum_buf[kNumKChunks][WGMMA::kNumAccum];
+                            #pragma unroll
+                            for (uint32_t kk = 0; kk < kNumKChunks; ++ kk)
                                 #pragma unroll
                                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(dst[i]);
-                                ptx::warpgroup_arrive();
+                                    ptx::warpgroup_fence_operand(accum_buf[kk][i]);
+                            ptx::warpgroup_arrive();
+                            #pragma unroll
+                            for (uint32_t kk = 0; kk < kNumKChunks; ++ kk) {
                                 a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + kk * WGMMA::K) / 16;
                                 b_desc.reg32_[0] = b_desc_base_lo + kk * WGMMA::K / 16;
-                                WGMMA::wgmma(a_desc, b_desc, dst, false);
-                                ptx::warpgroup_commit_batch();
-                            };
+                                WGMMA::wgmma(a_desc, b_desc, accum_buf[kk], false);
+                            }
+                            ptx::warpgroup_commit_batch();
+                            #pragma unroll
+                            for (uint32_t kk = 0; kk < kNumKChunks; ++ kk)
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(accum_buf[kk][i]);
+                            ptx::warpgroup_wait<0>();
+                            if (do_wgmma_store) {
+                                #pragma unroll
+                                for (uint32_t kk = 0; kk < kNumKChunks; ++ kk)
+                                    promote_chunk(accum_buf[kk], kk);
+                            }
+                        } else if constexpr (kTwoDeepPipeline) {
+                            // 2-deep software pipeline: overlap chunk (kk+1)'s WGMMA with chunk kk's
+                            // FP32 promotion using a ping-pong accumulator. Used when only two
+                            // accumulators fit under the register budget (BLOCK_N == 96).
+                            float accum_buf[2][WGMMA::kNumAccum];
 
                             // Prologue: launch the first chunk, then in each step launch the next
                             // chunk before draining the current one.
                             issue_chunk(accum_buf[0], 0);
                             #pragma unroll
-                            for (uint32_t kk = 0; kk < kNumChunks; ++ kk) {
+                            for (uint32_t kk = 0; kk < kNumKChunks; ++ kk) {
                                 const uint32_t cur = kk & 1;
-                                if (kk + 1 < kNumChunks)
+                                if (kk + 1 < kNumKChunks)
                                     issue_chunk(accum_buf[(kk + 1) & 1], kk + 1);
                                 #pragma unroll
                                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                                     ptx::warpgroup_fence_operand(accum_buf[cur][i]);
                                 // Non-last chunks keep the freshly issued (kk+1) group in flight and
                                 // only drain kk; the last chunk drains everything.
-                                if (kk + 1 < kNumChunks)
+                                if (kk + 1 < kNumKChunks)
                                     ptx::warpgroup_wait<1>();
                                 else
                                     ptx::warpgroup_wait<0>();
-                                promote_chunk(accum_buf[cur], kk);
+                                if (do_wgmma_store)
+                                    promote_chunk(accum_buf[cur], kk);
                             }
                         } else {
                             float accum[WGMMA::kNumAccum];
                             #pragma unroll
-                            for (uint32_t kk = 0; kk < BLOCK_K / WGMMA::K; ++ kk) {
-                                #pragma unroll
-                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(accum[i]);
-                                ptx::warpgroup_arrive();
-                                a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + kk * WGMMA::K) / 16;
-                                b_desc.reg32_[0] = b_desc_base_lo + kk * WGMMA::K / 16;
-                                WGMMA::wgmma(a_desc, b_desc, accum, false);
-                                ptx::warpgroup_commit_batch();
+                            for (uint32_t kk = 0; kk < kNumKChunks; ++ kk) {
+                                issue_chunk(accum, kk);
                                 #pragma unroll
                                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                                     ptx::warpgroup_fence_operand(accum[i]);
