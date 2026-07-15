@@ -40,7 +40,7 @@ public:
 #include <deep_gemm/impls/sm90_mxfp8_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
-static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 12;
+static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 13;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_mxfp8_fp8_gemm_1d2d_impl<
@@ -104,13 +104,14 @@ static void tune_mxfp8_fp8_smem_config(GemmConfig& config, const GemmDesc& desc)
 // The MXFP8 kernel promotes every 32-wide K chunk with a distinct UE8M0 scale, so it cannot
 // hardware-accumulate across the 4 chunks of a 128-K block the way FP8 does. To hide the
 // per-chunk WGMMA drain it runs a software pipeline over a per-chunk FP32 accumulator whose
-// depth is bounded by the register budget. Clamping to BLOCK_N == 64 gives kNumAccum == 32,
-// which is small enough to hold one accumulator per chunk (full, FP8-style pipeline) under the
-// 256-thread / 232-register budget, and (for n == 1024) tiles evenly with no wasted columns.
-// The shared SM90 heuristic maximizes MMA throughput and typically picks block_n up to 192,
-// which would force the serial fallback; re-select the fastest candidate with block_n <= 64 so
-// MXFP8 gets the deep pipeline. Other dtypes keep using the unconstrained heuristic.
-static constexpr int kMXFP8PipelineMaxBlockN = 64;
+// depth is bounded by the register budget. Clamping to BLOCK_N == 96 keeps kNumAccum == 48,
+// small enough for a 2-deep ping-pong pipeline under the 256-thread / 232-register budget.
+// (BLOCK_N == 64 was measured slower at large M: the 64x64x32 WGMMA loses more tensor-core
+// efficiency than the deeper pipeline recovers.) The shared SM90 heuristic maximizes MMA
+// throughput and typically picks block_n up to 192, which would force the serial fallback;
+// re-select the fastest candidate with block_n <= 96 so MXFP8 gets the pipeline. Other dtypes
+// keep using the unconstrained heuristic.
+static constexpr int kMXFP8PipelineMaxBlockN = 96;
 
 static GemmConfig get_mxfp8_fp8_best_config(const GemmDesc& desc) {
     auto config = get_best_config<SM90ArchSpec>(desc);
@@ -228,7 +229,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<false>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v12", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v13", code);
     SM90MXFP8FP8Gemm1D2DRuntime<false>::launch(runtime, args);
 }
 
@@ -314,7 +315,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<true>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v12", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v13", code);
     SM90MXFP8FP8Gemm1D2DRuntime<true>::launch(runtime, args);
 }
 
