@@ -40,7 +40,7 @@ public:
 #include <deep_gemm/impls/sm90_mxfp8_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
-static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 10;
+static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 11;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_mxfp8_fp8_gemm_1d2d_impl<
@@ -101,6 +101,50 @@ static void tune_mxfp8_fp8_smem_config(GemmConfig& config, const GemmDesc& desc)
     config.pipeline_config.smem_size = smem_extra + chosen_stages * merged_per_stage;
 }
 
+// The MXFP8 kernel promotes every 32-wide K chunk with a distinct UE8M0 scale, so it cannot
+// hardware-accumulate across the 4 chunks of a 128-K block the way FP8 does. To hide the
+// per-chunk WGMMA drain it runs a 2-deep software pipeline with a ping-pong FP32 accumulator,
+// which needs `kNumAccum = block_m * block_n / 128 <= 48` (i.e. block_n <= 96) to fit both
+// buffers under the 256-thread / 232-register budget. The shared SM90 heuristic maximizes MMA
+// throughput and typically picks block_n up to 192, which would force the serial fallback.
+// Re-select the best layout among candidates constrained to block_n <= 96 so MXFP8 gets the
+// pipeline; other dtypes keep using the unconstrained heuristic.
+static constexpr int kMXFP8PipelineMaxBlockN = 96;
+
+static GemmConfig get_mxfp8_fp8_best_config(const GemmDesc& desc) {
+    auto config = get_best_config<SM90ArchSpec>(desc);
+    if (config.layout.block_n <= kMXFP8PipelineMaxBlockN)
+        return config;
+
+    // Filter the candidate layouts down to those that keep the ping-pong accumulator small
+    // enough, then pick the fastest among them using the same cost model.
+    const auto layout_candidates = SM90ArchSpec::get_layout_candidates(desc);
+    bool found = false;
+    Layout best_layout{};
+    LayoutInfo best_info{};
+    for (const auto& candidate: layout_candidates) {
+        if (candidate.block_n > kMXFP8PipelineMaxBlockN)
+            continue;
+        const auto info = SM90ArchSpec::get_layout_info(desc, candidate);
+        if (not found or SM90ArchSpec::compare(info, best_info)) {
+            best_layout = candidate;
+            best_info = info;
+            found = true;
+        }
+    }
+
+    // No narrow candidate survived the heuristic's stage/swizzle filters: keep the original
+    // config so the kernel falls back to the (correct) serial path.
+    if (not found)
+        return config;
+
+    config.layout = best_layout;
+    config.storage_config = SM90ArchSpec::get_storage_config(desc, best_layout);
+    config.pipeline_config = SM90ArchSpec::get_pipeline_config(desc, best_layout, config.storage_config);
+    config.launch_config = SM90ArchSpec::get_launch_config(desc, best_layout);
+    return config;
+}
+
 static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         const torch::Tensor& a, const torch::Tensor& sfa,
         const torch::Tensor& b, const torch::Tensor& sfb,
@@ -129,7 +173,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
         .expected_m = m, .expected_n = n, .expected_k = k, .expected_num_groups = 1
     };
-    auto config = get_best_config<SM90ArchSpec>(desc);
+    auto config = get_mxfp8_fp8_best_config(desc);
     tune_mxfp8_fp8_smem_config(config, desc);
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
@@ -183,7 +227,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<false>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v10", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v11", code);
     SM90MXFP8FP8Gemm1D2DRuntime<false>::launch(runtime, args);
 }
 
@@ -215,7 +259,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
         .expected_m = m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
-    auto config = get_best_config<SM90ArchSpec>(desc);
+    auto config = get_mxfp8_fp8_best_config(desc);
     tune_mxfp8_fp8_smem_config(config, desc);
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
@@ -269,7 +313,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<true>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v10", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v11", code);
     SM90MXFP8FP8Gemm1D2DRuntime<true>::launch(runtime, args);
 }
 
