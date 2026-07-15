@@ -28,6 +28,21 @@ CUTLASS_DEVICE float e8m0_to_float(uint8_t scale) {
     return __uint_as_float(static_cast<uint32_t>(scale) << 23);
 }
 
+// Multiply two UE8M0 scales in the integer exponent domain instead of via two FP32
+// multiplies. Both are pure powers of two, so e8m0_to_float(Ea) * e8m0_to_float(Eb)
+// == 2^(Ea-127) * 2^(Eb-127) == 2^((Ea+Eb-127)-127); the product is exactly the float
+// whose biased exponent byte is Ea+Eb-127 (no rounding, mantissa stays zero). This moves
+// the scale combination off the FP32 pipe (which is the promotion bottleneck) onto the
+// integer ALU, leaving only the `* src` FMA on the FP32 pipe. Clamp the combined exponent
+// to [0, 255] so overflow saturates to +inf and underflow flushes to +0 (matching IEEE
+// multiply of the finite, normal scales MXFP8 amax-quantization produces) and, critically,
+// so the `<< 23` never corrupts the sign/mantissa bits with an out-of-range exponent.
+CUTLASS_DEVICE float e8m0_mul_to_float(uint8_t scale_a, uint8_t scale_b) {
+    const int biased = static_cast<int>(scale_a) + static_cast<int>(scale_b) - 127;
+    const uint32_t clamped = static_cast<uint32_t>(max(0, min(255, biased)));
+    return __uint_as_float(clamped << 23);
+}
+
 CUTLASS_DEVICE uint8_t load_e8m0_scale(const void* ptr, uint32_t base_offset,
                                        uint32_t k_scale_idx, uint32_t stride_k,
                                        bool packed_int32) {
@@ -333,20 +348,24 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
 
                         // FP32 promotion of one drained 32-K chunk `kk` from accumulator `src`.
                         auto promote_chunk = [&](const float* src, const uint32_t& kk) {
-                            const float scale_a_0 = mxfp8_fp8_detail::e8m0_to_float(
-                                static_cast<uint8_t>((sfa_pack_0 >> (kk * 8)) & 0xff));
-                            const float scale_a_1 = mxfp8_fp8_detail::e8m0_to_float(
-                                static_cast<uint8_t>((sfa_pack_1 >> (kk * 8)) & 0xff));
+                            const uint8_t scale_a_0 = static_cast<uint8_t>((sfa_pack_0 >> (kk * 8)) & 0xff);
+                            const uint8_t scale_a_1 = static_cast<uint8_t>((sfa_pack_1 >> (kk * 8)) & 0xff);
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                                const float scale_b_0 = mxfp8_fp8_detail::e8m0_to_float(
-                                    static_cast<uint8_t>((sfb_pack[i][0] >> (kk * 8)) & 0xff));
-                                const float scale_b_1 = mxfp8_fp8_detail::e8m0_to_float(
-                                    static_cast<uint8_t>((sfb_pack[i][1] >> (kk * 8)) & 0xff));
-                                shifted_accum[i * 4 + 0] += scale_a_0 * scale_b_0 * src[i * 4 + 0];
-                                shifted_accum[i * 4 + 1] += scale_a_0 * scale_b_1 * src[i * 4 + 1];
-                                shifted_accum[i * 4 + 2] += scale_a_1 * scale_b_0 * src[i * 4 + 2];
-                                shifted_accum[i * 4 + 3] += scale_a_1 * scale_b_1 * src[i * 4 + 3];
+                                const uint8_t scale_b_0 = static_cast<uint8_t>((sfb_pack[i][0] >> (kk * 8)) & 0xff);
+                                const uint8_t scale_b_1 = static_cast<uint8_t>((sfb_pack[i][1] >> (kk * 8)) & 0xff);
+                                // Combine the A/B UE8M0 scales in the integer exponent domain (one
+                                // int add + clamp + shift each) so the FP32 pipe only sees the `* src`
+                                // FMA below. Bit-exact with two IEEE FP32 scale multiplies for the
+                                // normal exponent range [1, 254] that MXFP8 amax-quantization emits.
+                                const float scale_00 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_0, scale_b_0);
+                                const float scale_01 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_0, scale_b_1);
+                                const float scale_10 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_1, scale_b_0);
+                                const float scale_11 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_1, scale_b_1);
+                                shifted_accum[i * 4 + 0] += scale_00 * src[i * 4 + 0];
+                                shifted_accum[i * 4 + 1] += scale_01 * src[i * 4 + 1];
+                                shifted_accum[i * 4 + 2] += scale_10 * src[i * 4 + 2];
+                                shifted_accum[i * 4 + 3] += scale_11 * src[i * 4 + 3];
                             }
                         };
 
