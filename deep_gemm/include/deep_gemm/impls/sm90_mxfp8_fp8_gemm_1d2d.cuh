@@ -28,21 +28,6 @@ CUTLASS_DEVICE float e8m0_to_float(uint8_t scale) {
     return __uint_as_float(static_cast<uint32_t>(scale) << 23);
 }
 
-// Multiply two UE8M0 scales in the integer exponent domain instead of via two FP32
-// multiplies. Both are pure powers of two, so e8m0_to_float(Ea) * e8m0_to_float(Eb)
-// == 2^(Ea-127) * 2^(Eb-127) == 2^((Ea+Eb-127)-127); the product is exactly the float
-// whose biased exponent byte is Ea+Eb-127 (no rounding, mantissa stays zero). This moves
-// the scale combination off the FP32 pipe (which is the promotion bottleneck) onto the
-// integer ALU, leaving only the `* src` FMA on the FP32 pipe. Clamp the combined exponent
-// to [0, 255] so overflow saturates to +inf and underflow flushes to +0 (matching IEEE
-// multiply of the finite, normal scales MXFP8 amax-quantization produces) and, critically,
-// so the `<< 23` never corrupts the sign/mantissa bits with an out-of-range exponent.
-CUTLASS_DEVICE float e8m0_mul_to_float(uint8_t scale_a, uint8_t scale_b) {
-    const int biased = static_cast<int>(scale_a) + static_cast<int>(scale_b) - 127;
-    const uint32_t clamped = static_cast<uint32_t>(max(0, min(255, biased)));
-    return __uint_as_float(clamped << 23);
-}
-
 CUTLASS_DEVICE uint8_t load_e8m0_scale(const void* ptr, uint32_t base_offset,
                                        uint32_t k_scale_idx, uint32_t stride_k,
                                        bool packed_int32) {
@@ -117,6 +102,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
 
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+    static constexpr uint32_t kNumMathWarpgroups = kNumMathThreads / 128;
 
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
@@ -126,10 +112,12 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SHAPE_K_SFA_PER_STAGE = BLOCK_K / 32;
-    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * SHAPE_K_SFA_PER_STAGE * sizeof(uint8_t);
+    // Materialize UE8M0 as FP32 in the producer warp. This shifts exponent unpacking out
+    // of the math warpgroups' promotion loop, where instruction issue is the bottleneck.
+    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * SHAPE_K_SFA_PER_STAGE * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE = math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
     static constexpr uint32_t SHAPE_K_SFB_PER_STAGE = BLOCK_K / 32;
-    static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = BLOCK_N * SHAPE_K_SFB_PER_STAGE * sizeof(uint8_t);
+    static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = BLOCK_N * SHAPE_K_SFB_PER_STAGE * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_SFB_SIZE_PER_STAGE = math::constexpr_align(SMEM_SFB_SIZE_PER_STAGE, 128u);
 
     const uint32_t num_total_k_blocks = math::ceil_div(shape_k, BLOCK_K);
@@ -153,23 +141,29 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
     });
     constexpr uint32_t SMEM_SF_OFFSET = SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
     auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<uint8_t*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
+        return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     });
     auto smem_sfb = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<uint8_t*>(smem_buffer + SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE +
-                                          i * ALIGNED_SMEM_SFB_SIZE_PER_STAGE);
+        return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE +
+                                        i * ALIGNED_SMEM_SFB_SIZE_PER_STAGE);
     });
 
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
         smem_buffer + SMEM_SF_OFFSET + kNumStages * (ALIGNED_SMEM_SFA_SIZE_PER_STAGE + ALIGNED_SMEM_SFB_SIZE_PER_STAGE));
     auto full_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
+    auto scale_full_barriers = utils::PatternVisitor([&](const uint32_t& i) {
+        return barrier_start_ptr + kNumStages * 2 + i;
+    });
 
     if (warp_idx == kNumMathThreads / 32 + 1 and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             full_barriers[i]->init(1);
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
+            #pragma unroll
+            for (uint32_t wg = 0; wg < kNumMathWarpgroups; ++ wg)
+                scale_full_barriers[i * kNumMathWarpgroups + wg]->init(1);
         }
         cutlass::arch::fence_barrier_init();
     }
@@ -215,6 +209,9 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                         tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, false>(&tensor_map_b, &full_barrier,
                                  smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                                  num_tma_multicast_b);
+                        // Publish A/B readiness immediately. Scale staging is guarded by
+                        // scale_full_barriers below, allowing chunk-0 WGMMA to overlap it.
+                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
                     }
 
                     const uint32_t sfa_base_m = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
@@ -229,8 +226,12 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                                 sfa, sfa_base_offset, k_block_idx, sfa_stride_k,
                                 sfa_gran_k, sfa_packed_int32, shape_k) :
                             0x7f7f7f7f;
-                        *reinterpret_cast<uint32_t*>(
-                            smem_sfa[stage_idx] + m_offset * SHAPE_K_SFA_PER_STAGE) = scales;
+                        ptx::st_shared(reinterpret_cast<float4*>(
+                            smem_sfa[stage_idx] + m_offset * SHAPE_K_SFA_PER_STAGE), make_float4(
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales)),
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales >> 8)),
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales >> 16)),
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales >> 24))));
                     }
 
                     const uint32_t sfb_group_idx = kMasked ?
@@ -246,14 +247,21 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                                 sfb, sfb_base_offset, k_block_idx, sfb_stride_k,
                                 sfb_gran_k, sfb_packed_int32, shape_k) :
                             0x7f7f7f7f;
-                        *reinterpret_cast<uint32_t*>(
-                            smem_sfb[stage_idx] + n_offset * SHAPE_K_SFB_PER_STAGE) = scales;
+                        ptx::st_shared(reinterpret_cast<float4*>(
+                            smem_sfb[stage_idx] + n_offset * SHAPE_K_SFB_PER_STAGE), make_float4(
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales)),
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales >> 8)),
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales >> 16)),
+                            mxfp8_fp8_detail::e8m0_to_float(static_cast<uint8_t>(scales >> 24))));
                     }
                     __threadfence_block();
                     __syncwarp();
 
-                    if (is_producer_leader)
-                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+                    if (is_producer_leader) {
+                        #pragma unroll
+                        for (uint32_t wg = 0; wg < kNumMathWarpgroups; ++ wg)
+                            scale_full_barriers[stage_idx * kNumMathWarpgroups + wg]->arrive();
+                    }
                 }
             }
 
@@ -321,47 +329,37 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                     for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
                         auto m_offset = local_idx * WAVE_BLOCK_M;
 
-                        // Pack-load all SFA/SFB bytes for this wave_block from SMEM:
-                        // SFA row stride is SHAPE_K_SFA_PER_STAGE (== BLOCK_K/32 == 4) bytes,
-                        // so 4 SFA bytes (one per kk) are loaded with a single 32-bit LDS.
-                        // SFB has the same layout; two adjacent N rows (n_base, n_base+1) form
-                        // 8 contiguous bytes that we fetch with a single ld.shared.v2.u32.
-                        uint32_t sfa_pack_0 = 0, sfa_pack_1 = 0;
-                        uint32_t sfb_pack[WGMMA::kNumAccum / 4][2];
-                        if (do_wgmma_store) {
-                            sfa_pack_0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                smem_sfa[stage_idx] + (r_0 + m_offset) * SHAPE_K_SFA_PER_STAGE));
-                            sfa_pack_1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                smem_sfa[stage_idx] + (r_1 + m_offset) * SHAPE_K_SFA_PER_STAGE));
-                            #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                                const uint32_t n_scale_offset = i * 8 + (lane_idx % 4) * 2;
-                                asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];\n"
-                                             : "=r"(sfb_pack[i][0]), "=r"(sfb_pack[i][1])
-                                             : "l"(__cvta_generic_to_shared(
-                                                     smem_sfb[stage_idx] +
-                                                     n_scale_offset * SHAPE_K_SFB_PER_STAGE)));
+                        // The producer materializes the four per-32-K scales as FP32. Hoist the
+                        // two A rows with LDS.128, but leave B scales in SMEM until promotion:
+                        // preloading every B scale would consume ~96 FP32 registers at BLOCK_N=96
+                        // and spill the 2-deep accumulator pipeline.
+                        float4 sfa_pack_0 = {}, sfa_pack_1 = {};
+                        auto load_scales = [&]() {
+                            if (do_wgmma_store) {
+                                sfa_pack_0 = ptx::ld_shared(reinterpret_cast<const float4*>(
+                                    smem_sfa[stage_idx] + (r_0 + m_offset) * SHAPE_K_SFA_PER_STAGE));
+                                sfa_pack_1 = ptx::ld_shared(reinterpret_cast<const float4*>(
+                                    smem_sfa[stage_idx] + (r_1 + m_offset) * SHAPE_K_SFA_PER_STAGE));
                             }
-                        }
+                        };
 
                         auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
 
                         // FP32 promotion of one drained 32-K chunk `kk` from accumulator `src`.
                         auto promote_chunk = [&](const float* src, const uint32_t& kk) {
-                            const uint8_t scale_a_0 = static_cast<uint8_t>((sfa_pack_0 >> (kk * 8)) & 0xff);
-                            const uint8_t scale_a_1 = static_cast<uint8_t>((sfa_pack_1 >> (kk * 8)) & 0xff);
+                            const float* scale_a_0 = reinterpret_cast<const float*>(&sfa_pack_0);
+                            const float* scale_a_1 = reinterpret_cast<const float*>(&sfa_pack_1);
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                                const uint8_t scale_b_0 = static_cast<uint8_t>((sfb_pack[i][0] >> (kk * 8)) & 0xff);
-                                const uint8_t scale_b_1 = static_cast<uint8_t>((sfb_pack[i][1] >> (kk * 8)) & 0xff);
-                                // Combine the A/B UE8M0 scales in the integer exponent domain (one
-                                // int add + clamp + shift each) so the FP32 pipe only sees the `* src`
-                                // FMA below. Bit-exact with two IEEE FP32 scale multiplies for the
-                                // normal exponent range [1, 254] that MXFP8 amax-quantization emits.
-                                const float scale_00 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_0, scale_b_0);
-                                const float scale_01 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_0, scale_b_1);
-                                const float scale_10 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_1, scale_b_0);
-                                const float scale_11 = mxfp8_fp8_detail::e8m0_mul_to_float(scale_a_1, scale_b_1);
+                                const uint32_t n_scale_offset = i * 8 + (lane_idx % 4) * 2;
+                                const float scale_b_0 = ptx::ld_shared(
+                                    smem_sfb[stage_idx] + n_scale_offset * SHAPE_K_SFB_PER_STAGE + kk);
+                                const float scale_b_1 = ptx::ld_shared(
+                                    smem_sfb[stage_idx] + (n_scale_offset + 1) * SHAPE_K_SFB_PER_STAGE + kk);
+                                const float scale_00 = scale_a_0[kk] * scale_b_0;
+                                const float scale_01 = scale_a_0[kk] * scale_b_1;
+                                const float scale_10 = scale_a_1[kk] * scale_b_0;
+                                const float scale_11 = scale_a_1[kk] * scale_b_1;
                                 shifted_accum[i * 4 + 0] += scale_00 * src[i * 4 + 0];
                                 shifted_accum[i * 4 + 1] += scale_01 * src[i * 4 + 1];
                                 shifted_accum[i * 4 + 2] += scale_10 * src[i * 4 + 2];
@@ -379,6 +377,18 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                             b_desc.reg32_[0] = b_desc_base_lo + kk * WGMMA::K / 16;
                             WGMMA::wgmma(a_desc, b_desc, dst, false);
                             ptx::warpgroup_commit_batch();
+                        };
+
+                        // TMA data is ready after full_barrier, but FP32 scale staging is
+                        // independent. Defer this wait until after chunk-0 has been issued so
+                        // WGMMA can cover producer-side scale expansion.
+                        bool scales_loaded = false;
+                        auto ensure_scales_loaded = [&]() {
+                            if (do_wgmma_store and not scales_loaded) {
+                                scale_full_barriers[stage_idx * kNumMathWarpgroups + math_wg_idx]->wait(phase);
+                                load_scales();
+                                scales_loaded = true;
+                            }
                         };
 
                         if constexpr (kFullPipeline) {
@@ -402,6 +412,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                                 WGMMA::wgmma(a_desc, b_desc, accum_buf[kk], false);
                             }
                             ptx::warpgroup_commit_batch();
+                            ensure_scales_loaded();
                             #pragma unroll
                             for (uint32_t kk = 0; kk < kNumKChunks; ++ kk)
                                 #pragma unroll
@@ -420,8 +431,11 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                             float accum_buf[2][WGMMA::kNumAccum];
 
                             // Prologue: launch the first chunk, then in each step launch the next
-                            // chunk before draining the current one.
+                            // chunk before draining the current one. Defer scale loading until
+                            // chunk-0 is in flight; issuing chunks 0+1 before the scale wait was
+                            // measured to increase scoreboard pressure.
                             issue_chunk(accum_buf[0], 0);
+                            ensure_scales_loaded();
                             #pragma unroll
                             for (uint32_t kk = 0; kk < kNumKChunks; ++ kk) {
                                 const uint32_t cur = kk & 1;
@@ -444,6 +458,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                             #pragma unroll
                             for (uint32_t kk = 0; kk < kNumKChunks; ++ kk) {
                                 issue_chunk(accum, kk);
+                                ensure_scales_loaded();
                                 #pragma unroll
                                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                                     ptx::warpgroup_fence_operand(accum[i]);

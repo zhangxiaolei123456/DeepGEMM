@@ -1,6 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
 
 #include <torch/python.h>
 
@@ -40,7 +44,7 @@ public:
 #include <deep_gemm/impls/sm90_mxfp8_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
-static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 14;
+static constexpr int kSm90MXFP8FP8ScaleRecipeJitVersion = 15;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_mxfp8_fp8_gemm_1d2d_impl<
@@ -82,19 +86,62 @@ static void __instantiate_kernel() {{
     }
 };
 
+struct SM90MXFP8FP8ContiguousLaunchKey {
+    int device, num_groups, m, n, k;
+    const void *a, *sfa, *b, *sfb, *d, *grouped_layout;
+    int64_t a_stride_m, b_stride_group, b_stride_n, d_stride_m;
+    int64_t sfa_stride_m, sfa_stride_k, sfb_stride_group, sfb_stride_n, sfb_stride_k;
+    uint32_t sfa_gran_k, sfb_gran_k;
+    bool sfa_packed_int32, sfb_packed_int32;
+    std::string compiled_dims;
+
+    bool operator==(const SM90MXFP8FP8ContiguousLaunchKey& other) const {
+        return device == other.device and num_groups == other.num_groups and
+               m == other.m and n == other.n and k == other.k and
+               a == other.a and sfa == other.sfa and b == other.b and sfb == other.sfb and
+               d == other.d and grouped_layout == other.grouped_layout and
+               a_stride_m == other.a_stride_m and b_stride_group == other.b_stride_group and
+               b_stride_n == other.b_stride_n and d_stride_m == other.d_stride_m and
+               sfa_stride_m == other.sfa_stride_m and sfa_stride_k == other.sfa_stride_k and
+               sfb_stride_group == other.sfb_stride_group and sfb_stride_n == other.sfb_stride_n and
+               sfb_stride_k == other.sfb_stride_k and
+               sfa_gran_k == other.sfa_gran_k and sfb_gran_k == other.sfb_gran_k and
+               sfa_packed_int32 == other.sfa_packed_int32 and
+               sfb_packed_int32 == other.sfb_packed_int32 and compiled_dims == other.compiled_dims;
+    }
+};
+
+struct SM90MXFP8FP8ContiguousLaunchState {
+    SM90MXFP8FP8ContiguousLaunchKey key;
+    SM90MXFP8FP8Gemm1D2DRuntime<false>::Args args;
+    std::shared_ptr<KernelRuntime> runtime;
+};
+
+// The normal serving path repeatedly launches the same GEMM over stable buffers. Cache the
+// complete host launch state for that one hot call site: config selection, TMA map encoding,
+// generated code and JIT runtime are all invariant while this key matches. The cache is
+// thread-local so independent Python execution threads never race on tensor lifetimes.
+static thread_local std::optional<SM90MXFP8FP8ContiguousLaunchState> sm90_mxfp8_fp8_contiguous_launch_state;
+
 static void tune_mxfp8_fp8_smem_config(GemmConfig& config, const GemmDesc& desc) {
     const int orig_num_stages = config.pipeline_config.num_stages;
     const int original_per_stage =
         config.storage_config.load_block_m * config.layout.block_k * c10::elementSize(desc.a_dtype) +
         config.storage_config.load_block_n * config.layout.block_k * c10::elementSize(desc.b_dtype) +
         align(config.layout.block_m * static_cast<int>(sizeof(float)), 128);
-    const int sfa_per_stage = align(config.layout.block_m * (config.layout.block_k / 32) * static_cast<int>(sizeof(uint8_t)), 128);
-    const int sfb_per_stage = align(config.layout.block_n * (config.layout.block_k / 32) * static_cast<int>(sizeof(uint8_t)), 128);
+    // The producer expands the four UE8M0 scales for every A/B row into FP32
+    // before publishing a stage, so the math warpgroup only loads scales and
+    // performs the exact scale product during promotion.
+    const int sfa_per_stage = align(config.layout.block_m * (config.layout.block_k / 32) * static_cast<int>(sizeof(float)), 128);
+    const int sfb_per_stage = align(config.layout.block_n * (config.layout.block_k / 32) * static_cast<int>(sizeof(float)), 128);
     const int smem_extra = config.pipeline_config.smem_size - orig_num_stages * original_per_stage;
+    // One 64-bit scale-ready mbarrier per math warpgroup and stage. The existing
+    // heuristic reserves the full/empty TMA barriers separately in smem_extra.
+    const int scale_barriers_per_stage = (config.launch_config.num_math_threads / 128) * static_cast<int>(sizeof(uint64_t));
     const int merged_per_stage =
         config.storage_config.load_block_m * config.layout.block_k * c10::elementSize(desc.a_dtype) +
         config.storage_config.load_block_n * config.layout.block_k * c10::elementSize(desc.b_dtype) +
-        sfa_per_stage + sfb_per_stage;
+        sfa_per_stage + sfb_per_stage + scale_barriers_per_stage;
     int chosen_stages = std::min(orig_num_stages, (SM90ArchSpec::smem_capacity - smem_extra) / merged_per_stage);
     DG_HOST_ASSERT(chosen_stages >= 1);
     config.pipeline_config.num_stages = chosen_stages;
@@ -163,6 +210,35 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
     DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt and grouped_layout.is_contiguous());
     DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
 
+    const auto sfa_gran_k = recipe_a.has_value()
+        ? std::get<1>(recipe_a.value())
+        : k / (static_cast<int>(sfa.size(1)) * (sfa.scalar_type() == torch::kInt ? 4 : 1));
+    DG_HOST_ASSERT(sfa_gran_k == 32 or sfa_gran_k == 128);
+    DG_HOST_ASSERT(sfa.size(1) == ceil_div(k, sfa_gran_k * (sfa.scalar_type() == torch::kInt ? 4 : 1)));
+    const auto sfb_gran_k = recipe_b.has_value()
+        ? std::get<1>(recipe_b.value())
+        : k / (static_cast<int>(sfb.size(-1)) * (sfb.scalar_type() == torch::kInt ? 4 : 1));
+    DG_HOST_ASSERT(sfb_gran_k == 32 or sfb_gran_k == 128);
+    DG_HOST_ASSERT(sfb.size(-1) == ceil_div(k, sfb_gran_k * (sfb.scalar_type() == torch::kInt ? 4 : 1)));
+
+    const SM90MXFP8FP8ContiguousLaunchKey launch_key = {
+        .device = a.get_device(), .num_groups = num_groups, .m = m, .n = n, .k = k,
+        .a = a.data_ptr(), .sfa = sfa.data_ptr(), .b = b.data_ptr(), .sfb = sfb.data_ptr(),
+        .d = d.data_ptr(), .grouped_layout = grouped_layout.data_ptr(),
+        .a_stride_m = a.stride(0), .b_stride_group = b.stride(0), .b_stride_n = b.stride(1),
+        .d_stride_m = d.stride(-2), .sfa_stride_m = sfa.stride(0), .sfa_stride_k = sfa.stride(1),
+        .sfb_stride_group = sfb.stride(0), .sfb_stride_n = sfb.stride(1), .sfb_stride_k = sfb.stride(2),
+        .sfa_gran_k = static_cast<uint32_t>(sfa_gran_k), .sfb_gran_k = static_cast<uint32_t>(sfb_gran_k),
+        .sfa_packed_int32 = sfa.scalar_type() == torch::kInt, .sfb_packed_int32 = sfb.scalar_type() == torch::kInt,
+        .compiled_dims = compiled_dims,
+    };
+    if (sm90_mxfp8_fp8_contiguous_launch_state.has_value() and
+        sm90_mxfp8_fp8_contiguous_launch_state->key == launch_key) {
+        const auto& cached = sm90_mxfp8_fp8_contiguous_launch_state.value();
+        SM90MXFP8FP8Gemm1D2DRuntime<false>::launch(cached.runtime, cached.args);
+        return;
+    }
+
     const auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedContiguous,
         .kernel_type = KernelType::Kernel1D2D,
@@ -179,16 +255,6 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
     tune_mxfp8_fp8_smem_config(config, desc);
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
-    const auto sfa_gran_k = recipe_a.has_value()
-        ? std::get<1>(recipe_a.value())
-        : k / (static_cast<int>(sfa.size(1)) * (sfa.scalar_type() == torch::kInt ? 4 : 1));
-    DG_HOST_ASSERT(sfa_gran_k == 32 or sfa_gran_k == 128);
-    DG_HOST_ASSERT(sfa.size(1) == ceil_div(k, sfa_gran_k * (sfa.scalar_type() == torch::kInt ? 4 : 1)));
-    const auto sfb_gran_k = recipe_b.has_value()
-        ? std::get<1>(recipe_b.value())
-        : k / (static_cast<int>(sfb.size(-1)) * (sfb.scalar_type() == torch::kInt ? 4 : 1));
-    DG_HOST_ASSERT(sfb_gran_k == 32 or sfb_gran_k == 128);
-    DG_HOST_ASSERT(sfb.size(-1) == ceil_div(k, sfb_gran_k * (sfb.scalar_type() == torch::kInt ? 4 : 1)));
 
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
                                               config.storage_config.load_block_m,
@@ -229,7 +295,12 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<false>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v14", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v15", code);
+    sm90_mxfp8_fp8_contiguous_launch_state = SM90MXFP8FP8ContiguousLaunchState {
+        .key = launch_key,
+        .args = args,
+        .runtime = runtime,
+    };
     SM90MXFP8FP8Gemm1D2DRuntime<false>::launch(runtime, args);
 }
 
@@ -315,7 +386,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<true>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v14", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v15", code);
     SM90MXFP8FP8Gemm1D2DRuntime<true>::launch(runtime, args);
 }
 
