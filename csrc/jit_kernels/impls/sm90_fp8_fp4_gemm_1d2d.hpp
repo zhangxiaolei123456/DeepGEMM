@@ -1304,8 +1304,9 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     const bool k32_quad_pair4x2_promote =
         k32_quad_reduce and not k32_quad_split_promote and
         env_enabled("DG_W4_K32_QUAD_PAIR4X2_PROMOTE");
-    // small_m_simple_sched：device 端 kUseSmallMSimpleSched 仅编译期检查
-    //   BLOCK_M<=8 + GroupedMasked + multicast=1，与 N/K 数值无关。
+    // small_m_simple_sched: device 端固定 m_block_idx=0，因此只有 caller
+    // 明确提供 max_m<=8 时才安全。expected_m 只是分布均值；hint 缺失时
+    // 可能存在 hot group，必须回退通用 masked scheduler 覆盖后续 M blocks。
     // 默认守护 (k>=4096 + n<=4096) 来自历史 g32 + n=4096 dsv4 形状的保守覆盖。
     // 放开到 RELAX 形状集 (g>=8 + n∈{4096,6144,7168} + k∈{2048,3072,4096,7168})
     // 让 DSV4 EP 业务真实 shape (g24 + n∈{6144,7168} + k∈{3072,7168} + expected_m=1/2/3)
@@ -1313,6 +1314,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     const int small_m_sched_m = std::max(
         expected_m, masked_m_max_hint.value_or(expected_m));
     const bool small_m_simple_sched =
+        masked_m_max_hint.has_value() and
         (gran_k_b == 32 or gran_k_b == 128) and small_m_sched_m <= 8 and
         ((static_cast<int64_t>(desc.k) >= 4096 and static_cast<int64_t>(desc.n) <= 4096) or
          (static_cast<int64_t>(desc.num_groups) >= 8 and
