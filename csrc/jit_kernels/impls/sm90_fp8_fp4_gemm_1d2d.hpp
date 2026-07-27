@@ -1008,25 +1008,21 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                     layout.block_n = 256;
                 }
             } else {
-                // path-A：cooperative prefetch + sfb→smem，BM 阶梯有效。
+                // path-A (gran_k_b=128)：cooperative prefetch + sfb→smem.
+                // This path has lower register pressure than the K/32 direct-load
+                // path, so keep BLOCK_N=256 to reduce N tiles. BLOCK_K is already
+                // fixed at 128 by the device kernel.
                 if (bm_select_m <= 8) layout.block_m = 8;
                 else if (bm_select_m <= 16) layout.block_m = 16;
                 else if (bm_select_m <= 32) layout.block_m = 32;
                 else if (bm_select_m <= 64) layout.block_m = 64;
                 layout.block_n = 256;
 
-                // DSV4 + 大 BM：BN=256→128 减小单 tile promote/store 链长，
-                // 让 grid 上 n-tile 翻倍提升 SM 间负载均衡。
-                if (layout.block_m >= 64 and dsv4_shape and
-                    env_int("DG_W4_LARGE_BM_BN128", 1) != 0) {
-                    layout.block_n = 128;
-                }
                 // DSV4 + small hot (bm_select∈(32,64])：BM=64 padding 浪费太大，
-                // 改 BM=32 BN=128 兼顾 hot/small group。
+                // 改 BM=32；gran_k_b=128 仍保持 BN=256。
                 if (bm_select_m > 32 and bm_select_m <= 64 and dsv4_shape and
                     env_int("DG_W4_SMALL_HOT_BM32", 1) != 0) {
                     layout.block_m = 32;
-                    layout.block_n = 128;
                 }
             }
             // 历史经验注记：
@@ -1294,13 +1290,15 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         k32_quad_reduce and not k32_quad_split_promote and
         env_enabled("DG_W4_K32_QUAD_PAIR4X2_PROMOTE");
     // small_m_simple_sched：device 端 kUseSmallMSimpleSched 仅编译期检查
-    //   BLOCK_M<=16 + GroupedMasked + multicast=1，与 N/K 数值无关。
+    //   BLOCK_M<=8 + GroupedMasked + multicast=1，与 N/K 数值无关。
     // 默认守护 (k>=4096 + n<=4096) 来自历史 g32 + n=4096 dsv4 形状的保守覆盖。
     // 放开到 RELAX 形状集 (g>=8 + n∈{4096,6144,7168} + k∈{2048,3072,4096,7168})
     // 让 DSV4 EP 业务真实 shape (g24 + n∈{6144,7168} + k∈{3072,7168} + expected_m=1/2/3)
     // 也能命中 simple_sched，避开通用 masked scheduler 的额外开销。
+    const int small_m_sched_m = std::max(
+        expected_m, masked_m_max_hint.value_or(expected_m));
     const bool small_m_simple_sched =
-        gran_k_b == 32 and expected_m <= 16 and
+        (gran_k_b == 32 or gran_k_b == 128) and small_m_sched_m <= 8 and
         ((static_cast<int64_t>(desc.k) >= 4096 and static_cast<int64_t>(desc.n) <= 4096) or
          (static_cast<int64_t>(desc.num_groups) >= 8 and
           static_cast<int64_t>(desc.num_groups) <= 36 and
