@@ -662,6 +662,54 @@ def test_sm90_fp8_fp4_masked_direct_fp32_scale() -> None:
     _print_markdown_table(rows)
 
 
+def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
+    _require_sm90()
+    torch.manual_seed(5)
+
+    def values_from_active(active_values: list[int], groups: int = 12) -> list[int]:
+        assert len(active_values) <= groups
+        assert all(value >= 0 for value in active_values)
+        return active_values + [0] * (groups - len(active_values))
+
+    print(
+        "DeepSeek Pro EP32 decode group128 B scale case: "
+        "hidden=7168, intermediate=3072, experts=384, topk=6, "
+        "local_groups=12, routed_tokens=8*6=48, "
+        "b.second shape = [local_groups, N, K/128]"
+    )
+
+    rows = []
+    shapes = [
+        ("gateup", 6144, 7168),
+        ("down", 7168, 3072),
+    ]
+    distributions = [
+        # EP32 => 384 / 32 = 12 local experts. Decode running-req=8,
+        # topk=6 gives 48 routed expert assignments, so the uniform average
+        # is 4 tokens per local expert.
+        ("uniform_4", [4] * 12, 4),
+        # Mild and heavy skew variants keep the same 48 routed assignments
+        # but cover realistic router imbalance around the decode hot expert.
+        ("skew_hot12", values_from_active([12, 8, 6, 4, 4, 3, 3, 2, 2, 2, 1, 1]), 4),
+        ("skew_hot24", values_from_active([24, 8, 4, 3, 2, 2, 1, 1, 1, 1, 1]), 4),
+    ]
+    for shape_name, n, k in shapes:
+        for dist_name, masked_m_values, expected_m in distributions:
+            rows.append(
+                _masked_skew_benchmark_case(
+                    f"ds_pro_ep32_g128_{shape_name}_{dist_name}",
+                    masked_m_values,
+                    expected_m=expected_m,
+                    n=n,
+                    k=k,
+                    max_m=128,
+                    b_gran_k=128,
+                    pass_hints=True,
+                )
+            )
+    _print_skew_table(rows)
+
+
 def test_sm90_fp8_fp4_masked_skew_cases() -> None:
     _require_sm90()
     torch.manual_seed(4)
@@ -914,6 +962,11 @@ if __name__ == "__main__":
     #     test_sm90_fp8_fp4_contiguous()
     if os.getenv("DG_W4_MASKED_SKEW_CASES", "0") not in ("", "0"):
         test_sm90_fp8_fp4_masked_skew_cases()
+    elif (
+        os.getenv("DG_W4_MASKED_DEEPSEEK_PRO_G128", "0") not in ("", "0")
+        or os.getenv("DG_W4_MASKED_G128_SCALE", "0") not in ("", "0")
+    ):
+        test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale()
     elif os.getenv("DG_W4_MASKED_DIRECT_FP32_SCALE", "0") not in ("", "0"):
         test_sm90_fp8_fp4_masked_direct_fp32_scale()
     else:
