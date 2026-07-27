@@ -1015,10 +1015,11 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                     layout.block_n = 256;
                 }
             } else {
-                // path-A (gran_k_b=128)：cooperative prefetch + sfb→smem.
-                // This path has lower register pressure than the K/32 direct-load
-                // path, so keep BLOCK_N=256 to reduce N tiles. BLOCK_K is already
-                // fixed at 128 by the device kernel.
+                // path-A (gran_k_b=128): BF16 SFB direct-load by default.
+                // BM=8/16 keeps BN=256 to minimize CTA count. BM=32 uses BN=128
+                // to halve the two-wave final-accum footprint and reduce register
+                // pressure; set DG_W4_G128_BM32_BN128=0 to restore BN=256.
+                // BLOCK_K is fixed at 128 by the device kernel.
                 if (bm_select_m <= 8) layout.block_m = 8;
                 else if (bm_select_m <= 16) layout.block_m = 16;
                 else if (bm_select_m <= 32) layout.block_m = 32;
@@ -1030,6 +1031,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                 if (bm_select_m > 32 and bm_select_m <= 64 and dsv4_shape and
                     env_int("DG_W4_SMALL_HOT_BM32", 1) != 0) {
                     layout.block_m = 32;
+                }
+                if (layout.block_m == 32 and
+                    env_int("DG_W4_G128_BM32_BN128", 1) != 0) {
+                    layout.block_n = 128;
                 }
             }
             // 历史经验注记：
