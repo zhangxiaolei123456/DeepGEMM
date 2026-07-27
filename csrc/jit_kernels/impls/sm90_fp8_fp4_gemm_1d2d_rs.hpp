@@ -91,6 +91,9 @@ public:
         bool g128_fast_partial_store;
         // Issued by the elected TMA producer.
         bool g128_scale_b_l2_prefetch;
+        // Process two consecutive M blocks per logical B tile and retain
+        // packed B in the stage ring for the second block.
+        bool g128_mblock_b_reuse;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -118,6 +121,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -272,7 +276,8 @@ static void __instantiate_kernel() {{
         args.scale_b_e8m0 ? "true" : "false",
         args.reorder_masked_by_max_m ? "true" : "false",
         args.g128_fast_partial_store ? "true" : "false",
-        args.g128_scale_b_l2_prefetch ? "true" : "false");
+        args.g128_scale_b_l2_prefetch ? "true" : "false",
+        args.g128_mblock_b_reuse ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

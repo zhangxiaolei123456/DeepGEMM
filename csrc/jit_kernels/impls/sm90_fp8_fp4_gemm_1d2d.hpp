@@ -1369,6 +1369,17 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     const bool g128_scale_b_l2_prefetch =
         gran_k_b == 128 and scale_b_direct_load and scale_b_bf16 and
         env_int("DG_W4_G128_SFB_PREFETCH", 1) != 0;
+    // Experimental no-hint sparse-hot path: process two consecutive M blocks
+    // per logical B tile. The second block retains packed B in the stage ring,
+    // which is safe only when a full K sweep returns to the same stage index.
+    const bool g128_mblock_b_reuse =
+        gran_k_b == 128 and g128_bf16_direct_load and
+        not masked_m_max_hint.has_value() and
+        (config.layout.block_m == 8 or config.layout.block_m == 16) and
+        config.layout.block_n == 256 and
+        ceil_div(static_cast<int>(k), config.layout.block_k) %
+                config.pipeline_config.num_stages == 0 and
+        env_int("DG_W4_G128_MBLOCK_REUSE", 0) != 0;
     // E8M0 SFB（仅 path-B fast-path）：每元素 1B = fp32 的 8 位指数，体积再砍 2x。
     // 解码 `__uint_as_float(uint32(e) << 23)` 零误差。**默认开启**：当用户传入
     // uint8 sfb 时自动启用；显式 `DG_W4_SCALE_B_E8M0=0` 时回退。
@@ -1414,6 +1425,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .reorder_masked_by_max_m = reorder_masked_by_max_m,
         .g128_fast_partial_store = g128_fast_partial_store,
         .g128_scale_b_l2_prefetch = g128_scale_b_l2_prefetch,
+        .g128_mblock_b_reuse = g128_mblock_b_reuse,
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .sfb = sfb.data_ptr(),
