@@ -30,6 +30,9 @@ public:
         cute::UMMA::Major major_sfb;
         bool scale_b_direct_load;
         bool scale_b_pow2_promote;
+        // Adjacent lanes consume the low/high FP4 halves of the same packed
+        // word. Let the even lane load once and broadcast with shfl.
+        bool decode_pair_shfl;
         bool k32_quad_reduce;
         // 杠杆3：把 quad-reduce（4 累加器，峰值 64 float→spill）退化为已存在的
         // 2 累加器串行 pair-reduce（峰值 32 float），消除寄存器 spill。保持
@@ -233,7 +236,7 @@ static void __instantiate_kernel() {{
         "false",
         "false",
         "false",
-        "false",
+        args.decode_pair_shfl ? "true" : "false",
         "false",
         args.k32_quad_reduce ? "true" : "false",
         args.k32_pair_reduce ? "true" : "false",
