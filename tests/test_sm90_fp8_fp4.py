@@ -695,18 +695,19 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
     ]
     for shape_name, n, k in shapes:
         for dist_name, masked_m_values, expected_m in distributions:
-            rows.append(
-                _masked_skew_benchmark_case(
-                    f"ds_pro_ep32_g128_{shape_name}_{dist_name}",
-                    masked_m_values,
-                    expected_m=expected_m,
-                    n=n,
-                    k=k,
-                    max_m=128,
-                    b_gran_k=128,
-                    pass_hints=True,
+            for pass_hints, suffix in ((True, ""), (False, "_no_hint")):
+                rows.append(
+                    _masked_skew_benchmark_case(
+                        f"ds_pro_ep32_g128_{shape_name}_{dist_name}{suffix}",
+                        masked_m_values,
+                        expected_m=expected_m,
+                        n=n,
+                        k=k,
+                        max_m=128,
+                        b_gran_k=128,
+                        pass_hints=pass_hints,
+                    )
                 )
-            )
     _print_skew_table(rows)
 
 
