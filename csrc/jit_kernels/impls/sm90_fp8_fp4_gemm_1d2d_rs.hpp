@@ -30,9 +30,6 @@ public:
         cute::UMMA::Major major_sfb;
         bool scale_b_direct_load;
         bool scale_b_pow2_promote;
-        // Performance-only probe: replace SFB with 1.0 and remove its loads.
-        // Results are intentionally numerically incorrect when enabled.
-        bool scale_b_stub;
         bool k32_quad_reduce;
         // 杠杆3：把 quad-reduce（4 累加器，峰值 64 float→spill）退化为已存在的
         // 2 累加器串行 pair-reduce（峰值 32 float），消除寄存器 spill。保持
@@ -92,6 +89,8 @@ public:
         // Group128 BF16 masked partial tile: directly store valid rows from
         // final_accum and skip STSM -> smem_d -> scalar copy-back.
         bool g128_fast_partial_store;
+        // 0: disabled, 1: L2, 2: L1. Issued by the elected TMA producer.
+        uint32_t g128_scale_b_prefetch_mode;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -184,6 +183,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -209,7 +209,7 @@ static void __instantiate_kernel() {{
         get_default_epilogue_type(std::nullopt),
         "false",
         args.scale_a_stub ? "true" : "false",
-        args.scale_b_stub ? "true" : "false",
+        "false",
         "false",
         "false",
         args.scale_b_pow2_promote ? "true" : "false",
@@ -271,7 +271,8 @@ static void __instantiate_kernel() {{
         args.scale_b_bf16 ? "true" : "false",
         args.scale_b_e8m0 ? "true" : "false",
         args.reorder_masked_by_max_m ? "true" : "false",
-        args.g128_fast_partial_store ? "true" : "false");
+        args.g128_fast_partial_store ? "true" : "false",
+        args.g128_scale_b_prefetch_mode);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

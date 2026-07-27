@@ -691,7 +691,8 @@ template <cute::UMMA::Major kMajorSFB,
           bool kScaleBBF16 = false,
           bool kScaleBE8M0 = false,
           bool kReorderMaskedByMaxM = false,
-          bool kFastPartialMaskedStore = false>
+          bool kFastPartialMaskedStore = false,
+          uint32_t kScaleBPrefetchMode = 0>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -715,6 +716,11 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      "DG_W4_SCALE_K_GROUP only supports 1/2/4");
     DG_STATIC_ASSERT(not kBIsInt4Sym, "RS-mode FP8xFP4 kernel does not support INT4-sym B");
     DG_STATIC_ASSERT(not (kScaleBBF16 and kScaleBE8M0), "Scale-B cannot be both BF16 and E8M0");
+    DG_STATIC_ASSERT(kScaleBPrefetchMode <= 2, "Scale-B prefetch mode must be 0/1/2");
+    DG_STATIC_ASSERT(kScaleBPrefetchMode == 0 or
+                     (kScaleBDirectLoad and kScaleBGranK == 128 and kScaleBBF16 and
+                      kMajorSFB == cute::UMMA::Major::MN),
+                     "Scale-B prefetch only supports group128 BF16 MN-major direct-load");
     DG_STATIC_ASSERT(not kScaleBE8M0 or (kScaleBDirectLoad and kScaleBGranK == 32),
                      "E8M0 Scale-B is only supported by direct-load per-32 path");
     DG_STATIC_ASSERT(not kScaleBBF16 or kScaleBGranK == 128 or
@@ -945,6 +951,25 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                  k_idx_packed,
                                  scheduler.template get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                                  num_tma_multicast_b, batch_idx);
+                    }
+
+                    if constexpr (kScaleBPrefetchMode != 0) {
+                        const uint32_t n_base = n_block_idx * BLOCK_N;
+                        const uint32_t valid_n = min(BLOCK_N, shape_n - n_base);
+                        const uint32_t sfb_offset =
+                            get_current_group_idx() * aligned_shape_n_sfb * shape_k_scales_b +
+                            k_block_idx * aligned_shape_n_sfb + n_base;
+                        auto* sfb_bf16 = reinterpret_cast<nv_bfloat16*>(sfb) + sfb_offset;
+                        constexpr uint32_t kPrefetchBytes = 128;
+                        for (uint32_t byte_offset = 0;
+                             byte_offset < valid_n * sizeof(nv_bfloat16);
+                             byte_offset += kPrefetchBytes) {
+                            void* ptr = reinterpret_cast<uint8_t*>(sfb_bf16) + byte_offset;
+                            if constexpr (kScaleBPrefetchMode == 1)
+                                ptx::prefetch_l2(ptr);
+                            else
+                                ptx::prefetch_l1(ptr);
+                        }
                     }
 
                     constexpr uint32_t kExpectedTxBytes = SMEM_A_TMA_SIZE_PER_STAGE +

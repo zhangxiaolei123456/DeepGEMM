@@ -284,4 +284,8 @@ CUTLASS_DEVICE void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+CUTLASS_DEVICE void prefetch_l2(void *ptr) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr));
+}
+
 } // namespace deep_gemm::ptx

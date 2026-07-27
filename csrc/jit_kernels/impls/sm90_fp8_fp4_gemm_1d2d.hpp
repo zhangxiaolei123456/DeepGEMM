@@ -1255,10 +1255,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         (gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
          not fuse_scale_b_decode) or
         g128_bf16_direct_load;
-    // Performance-only probe for attributing long-scoreboard stalls to the
-    // group128 BF16 SFB global loads. This deliberately produces wrong values.
-    const bool scale_b_stub =
-        gran_k_b == 128 and env_int("DG_W4_G128_SCALE_B_STUB", 0) != 0;
     const bool k32_quad_reduce =
         gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
         not fuse_scale_b_decode;
@@ -1368,6 +1364,11 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
          gran_k_b == 128) and
         not env_disabled("DG_W4_SCALE_B_BF16") and
         sfb.scalar_type() == torch::kBFloat16;
+    const int g128_scale_b_prefetch_mode =
+        gran_k_b == 128 and scale_b_direct_load and scale_b_bf16
+            ? env_int("DG_W4_G128_SFB_PREFETCH", 1)
+            : 0;
+    DG_HOST_ASSERT(g128_scale_b_prefetch_mode >= 0 and g128_scale_b_prefetch_mode <= 2);
     // E8M0 SFB（仅 path-B fast-path）：每元素 1B = fp32 的 8 位指数，体积再砍 2x。
     // 解码 `__uint_as_float(uint32(e) << 23)` 零误差。**默认开启**：当用户传入
     // uint8 sfb 时自动启用；显式 `DG_W4_SCALE_B_E8M0=0` 时回退。
@@ -1391,7 +1392,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .major_sfb = get_major_type_ab(sfb),
         .scale_b_direct_load = scale_b_direct_load,
         .scale_b_pow2_promote = scale_b_pow2_promote,
-        .scale_b_stub = scale_b_stub,
         .k32_quad_reduce = k32_quad_reduce,
         .k32_pair_reduce = k32_pair_reduce,
         .k32_bf16_final_accum = k32_bf16_final_accum,
@@ -1413,6 +1413,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .scale_b_e8m0 = scale_b_e8m0,
         .reorder_masked_by_max_m = reorder_masked_by_max_m,
         .g128_fast_partial_store = g128_fast_partial_store,
+        .g128_scale_b_prefetch_mode = static_cast<uint32_t>(g128_scale_b_prefetch_mode),
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .sfb = sfb.data_ptr(),
