@@ -647,6 +647,11 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const char* value = std::getenv(name);
         return (value != nullptr and value[0] != '\0') ? std::atoi(value) : default_value;
     };
+    const bool g128_bf16_direct_load =
+        gran_k_b == 128 and
+        sfb.scalar_type() == torch::kBFloat16 and
+        not env_disabled("DG_W4_SCALE_B_BF16") and
+        env_int("DG_W4_G128_BF16_DIRECT_LOAD", 1) != 0;
     // BM=64 fast-path 是否启用（函数作用域统一判据，供三处共用：layout 选择 /
     // bm32_skew_layout(stages) / bm32_skew_fast_path(device 三件套总闸)）。
     //   两个触发源：
@@ -688,9 +693,9 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             const int last = tiles - (waves - 1) * num_sms;
             const int last_util = last <= 0 ? num_sms : last;
             const bool uniform_scale_b = (block_k % bn == 0);
-            const int sfb_old_bytes = gran_k_b == 32 ? 0 :
+            const int sfb_old_bytes = (gran_k_b == 32 or g128_bf16_direct_load) ? 0 :
                 align(shape_k_scales_b * (uniform_scale_b ? 1 : 2) * static_cast<int>(sizeof(float)), 16);
-            const int sfb_cache_bytes = gran_k_b == 32 ? 0 :
+            const int sfb_cache_bytes = (gran_k_b == 32 or g128_bf16_direct_load) ? 0 :
                 align(shape_k_scales_b * bn * static_cast<int>(sizeof(float)), 16);
             const int rs_padded_bm = std::max(bm, 64);
             const int smem_d_bytes =
@@ -1076,9 +1081,9 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const int block_n = config.layout.block_n;
         const int shape_k_scales_b = ceil_div(static_cast<int>(k), gran_k_b);
         const bool uniform_scale_b = (block_k % block_n == 0);
-        const int sfb_old_bytes = gran_k_b == 32 ? 0 :
+        const int sfb_old_bytes = (gran_k_b == 32 or g128_bf16_direct_load) ? 0 :
             align(shape_k_scales_b * (uniform_scale_b ? 1 : 2) * static_cast<int>(sizeof(float)), 16);
-        const int sfb_cache_bytes = gran_k_b == 32 ? 0 :
+        const int sfb_cache_bytes = (gran_k_b == 32 or g128_bf16_direct_load) ? 0 :
             align(shape_k_scales_b * block_n * static_cast<int>(sizeof(float)), 16);
         const int rs_padded_bm = std::max(config.layout.block_m, 64);
         const int base_smem_d_bytes =
@@ -1235,11 +1240,14 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     // 时有意义，用于测"解 issue 串行依赖"能否补回 fuse 路径在大 M 的退化。默认关。
     const bool fuse_predecode_pair =
         fuse_scale_b_decode and env_int("DG_W4_FUSE_PREDECODE_PAIR", 0) != 0;
-    // fuse_scale_b_decode 一旦开启，所有 fast-path / direct-load / e8m0 / bf16
+    // fuse_scale_b_decode 一旦开启，path-B fast-path / direct-load / e8m0 / bf16
     // 互斥关闭——device 那边 static_assert 会拒绝同时开启。
+    // path-A group128 BF16 scale 默认走 direct-load，避免小-M decode 为每个 CTA
+    // 预先把整块 [K/128, BN] scale 转成 FP32 并写入 shared memory。
     const bool scale_b_direct_load =
-        gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
-        not fuse_scale_b_decode;
+        (gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
+         not fuse_scale_b_decode) or
+        g128_bf16_direct_load;
     const bool k32_quad_reduce =
         gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
         not fuse_scale_b_decode;
@@ -1340,7 +1348,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         compact_masked_sched and env_int("DG_W4_PATHB_REORDER_BY_MM", 0) != 0;
     // bf16 SFB：体积砍半，**默认开启**。两条 fast-path：
     //  - path-B (gran_k_b==32 + direct-load)：load_sfb / load_k32_quad_scale_b 直读 gmem。
-    //  - path-A (gran_k_b==128)：cooperative prefetch 经 smem，smem 也存 bf16。
+    //  - path-A (gran_k_b==128)：默认 direct-load，DG_W4_G128_BF16_DIRECT_LOAD=0
+    //    时回退 cooperative prefetch，经 smem 缓存为 fp32。
     // 仍要避开 packed-UE8M0 / fused-decode 等假设 fp32 位级布局的分支。
     // 显式 `DG_W4_SCALE_B_BF16=0` 时回退 fp32；用户传的 sfb 实际是 fp32 也自然回退。
     const bool scale_b_bf16 =

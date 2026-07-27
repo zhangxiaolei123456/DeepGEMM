@@ -765,7 +765,8 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
         math::align<uint32_t>((BLOCK_K / kScaleBGranK) *
                               (kFuseScaleBDecode ? math::ceil_div(BLOCK_N, 4u) : BLOCK_N) *
                               sizeof(float), 16u) :
-        math::align<uint32_t>(shape_k_scales_b * BLOCK_N * sizeof(float), 16u);
+        (kScaleBDirectLoad ? 0u :
+         math::align<uint32_t>(shape_k_scales_b * BLOCK_N * sizeof(float), 16u));
     // NOTES: Make sure we have enough shared memory for WGMMA padding
     static constexpr uint32_t WGMMA_A_SIZE_PER_STAGE = WGMMA::M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     DG_STATIC_ASSERT(WGMMA_A_SIZE_PER_STAGE <= SMEM_A_SIZE_PER_STAGE, "Memory Out of bound for WGMMA");
@@ -979,7 +980,7 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
         while (get_next_block()) {
             const uint32_t current_group_idx = get_current_group_idx();
 
-            if constexpr (kScaleBGranK == 128) {
+            if constexpr (kScaleBGranK == 128 and not kScaleBDirectLoad) {
                 // Cooperatively prefetch the SFB tile for this block from gmem to smem.
                 // Layout in smem: [shape_k_scales_b, BLOCK_N] (k outer, n inner).
                 // Out-of-bound n is filled with 1.0f to keep `n_idx >= shape_n` neutral.
@@ -1185,7 +1186,7 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
             auto load_sfb = [&](uint32_t n_idx, uint32_t k_block_idx) {
                 if (n_idx >= shape_n)
                     return 1.0f;
-                if constexpr (kScaleBDirectLoad and kScaleBGranK == 32) {
+                if constexpr (kScaleBDirectLoad) {
                     if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
                         const uint32_t offset =
                             current_group_idx * aligned_shape_n_sfb * shape_k_scales_b +
