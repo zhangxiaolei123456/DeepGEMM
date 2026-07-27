@@ -1255,6 +1255,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         (gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
          not fuse_scale_b_decode) or
         g128_bf16_direct_load;
+    // Performance-only probe for attributing long-scoreboard stalls to the
+    // group128 BF16 SFB global loads. This deliberately produces wrong values.
+    const bool scale_b_stub =
+        gran_k_b == 128 and env_int("DG_W4_G128_SCALE_B_STUB", 0) != 0;
     const bool k32_quad_reduce =
         gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
         not fuse_scale_b_decode;
@@ -1387,6 +1391,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .major_sfb = get_major_type_ab(sfb),
         .scale_b_direct_load = scale_b_direct_load,
         .scale_b_pow2_promote = scale_b_pow2_promote,
+        .scale_b_stub = scale_b_stub,
         .k32_quad_reduce = k32_quad_reduce,
         .k32_pair_reduce = k32_pair_reduce,
         .k32_bf16_final_accum = k32_bf16_final_accum,

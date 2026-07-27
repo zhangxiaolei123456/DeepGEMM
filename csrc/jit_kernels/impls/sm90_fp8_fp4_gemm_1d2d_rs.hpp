@@ -30,6 +30,9 @@ public:
         cute::UMMA::Major major_sfb;
         bool scale_b_direct_load;
         bool scale_b_pow2_promote;
+        // Performance-only probe: replace SFB with 1.0 and remove its loads.
+        // Results are intentionally numerically incorrect when enabled.
+        bool scale_b_stub;
         bool k32_quad_reduce;
         // 杠杆3：把 quad-reduce（4 累加器，峰值 64 float→spill）退化为已存在的
         // 2 累加器串行 pair-reduce（峰值 32 float），消除寄存器 spill。保持
@@ -206,7 +209,7 @@ static void __instantiate_kernel() {{
         get_default_epilogue_type(std::nullopt),
         "false",
         args.scale_a_stub ? "true" : "false",
-        "false",
+        args.scale_b_stub ? "true" : "false",
         "false",
         "false",
         args.scale_b_pow2_promote ? "true" : "false",
