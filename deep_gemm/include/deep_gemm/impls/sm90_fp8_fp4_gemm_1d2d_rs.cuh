@@ -714,8 +714,11 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      "DG_W4_SCALE_K_GROUP only supports 1/2/4");
     DG_STATIC_ASSERT(not kBIsInt4Sym, "RS-mode FP8xFP4 kernel does not support INT4-sym B");
     DG_STATIC_ASSERT(not (kScaleBBF16 and kScaleBE8M0), "Scale-B cannot be both BF16 and E8M0");
-    DG_STATIC_ASSERT((not kScaleBBF16 and not kScaleBE8M0) or (kScaleBDirectLoad and kScaleBGranK == 32),
-                     "Compressed Scale-B dtypes are only supported by direct-load per-32 path");
+    DG_STATIC_ASSERT(not kScaleBE8M0 or (kScaleBDirectLoad and kScaleBGranK == 32),
+                     "E8M0 Scale-B is only supported by direct-load per-32 path");
+    DG_STATIC_ASSERT(not kScaleBBF16 or kScaleBGranK == 128 or
+                     (kScaleBDirectLoad and kScaleBGranK == 32),
+                     "BF16 Scale-B only supports per-128 path or direct-load per-32 path");
     DG_STATIC_ASSERT(kFuseScaleBDecodeAssumeExp == 0 or kFuseScaleBDecodeAssumeExp == 5 or
                      kFuseScaleBDecodeAssumeExp == 6,
                      "DG_W4_FUSE_SCALE_B_DECODE_ASSUME_EXP only supports 0/5/6");
@@ -992,29 +995,48 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                      "BLOCK_N must be a multiple of 4 for vectorized SFB load");
                     constexpr uint32_t kVecsPerRow = BLOCK_N / kVec;
                     const uint32_t total_vecs = shape_k_scales_b * kVecsPerRow;
-                    const float* sfb_base = sfb +
-                        current_group_idx * aligned_shape_n_sfb * shape_k_scales_b;
-                    // Issue cp.async (16B per thread) for fully in-bounds vectors;
-                    // fall back to scalar st.shared with 1.0f-fill for the tail.
-                    for (uint32_t i = threadIdx.x; i < total_vecs; i += kNumMathThreads) {
-                        const uint32_t k_idx = i / kVecsPerRow;
-                        const uint32_t vec_n = i % kVecsPerRow;
-                        const uint32_t n_off = vec_n * kVec;
-                        const uint32_t n_idx = n_block_base + n_off;
-                        float* smem_dst = smem_sfb + k_idx * BLOCK_N + n_off;
-                        if (n_idx + kVec <= shape_n) {
-                            const float* gmem_src = sfb_base +
-                                k_idx * aligned_shape_n_sfb + n_idx;
-                            ptx::cp_async_16(smem_dst, gmem_src);
-                        } else {
-                            // Tail: at least one element is OOB; use scalar st with 1.0f fill.
+                    if constexpr (kScaleBBF16) {
+                        const auto* sfb_base = reinterpret_cast<const nv_bfloat16*>(sfb) +
+                            current_group_idx * aligned_shape_n_sfb * shape_k_scales_b;
+                        for (uint32_t i = threadIdx.x; i < total_vecs; i += kNumMathThreads) {
+                            const uint32_t k_idx = i / kVecsPerRow;
+                            const uint32_t vec_n = i % kVecsPerRow;
+                            const uint32_t n_off = vec_n * kVec;
+                            const uint32_t n_idx = n_block_base + n_off;
+                            float* smem_dst = smem_sfb + k_idx * BLOCK_N + n_off;
+                            const auto* sfb_row = sfb_base + k_idx * aligned_shape_n_sfb + n_idx;
                             float4 vals;
-                            const float* sfb_row = sfb_base + k_idx * aligned_shape_n_sfb + n_idx;
-                            vals.x = (n_idx + 0 < shape_n) ? *(sfb_row + 0) : 1.0f;
-                            vals.y = (n_idx + 1 < shape_n) ? *(sfb_row + 1) : 1.0f;
-                            vals.z = (n_idx + 2 < shape_n) ? *(sfb_row + 2) : 1.0f;
-                            vals.w = (n_idx + 3 < shape_n) ? *(sfb_row + 3) : 1.0f;
+                            vals.x = (n_idx + 0 < shape_n) ? __bfloat162float(*(sfb_row + 0)) : 1.0f;
+                            vals.y = (n_idx + 1 < shape_n) ? __bfloat162float(*(sfb_row + 1)) : 1.0f;
+                            vals.z = (n_idx + 2 < shape_n) ? __bfloat162float(*(sfb_row + 2)) : 1.0f;
+                            vals.w = (n_idx + 3 < shape_n) ? __bfloat162float(*(sfb_row + 3)) : 1.0f;
                             ptx::st_shared(reinterpret_cast<float4*>(smem_dst), vals);
+                        }
+                    } else {
+                        const float* sfb_base = sfb +
+                            current_group_idx * aligned_shape_n_sfb * shape_k_scales_b;
+                        // Issue cp.async (16B per thread) for fully in-bounds vectors;
+                        // fall back to scalar st.shared with 1.0f-fill for the tail.
+                        for (uint32_t i = threadIdx.x; i < total_vecs; i += kNumMathThreads) {
+                            const uint32_t k_idx = i / kVecsPerRow;
+                            const uint32_t vec_n = i % kVecsPerRow;
+                            const uint32_t n_off = vec_n * kVec;
+                            const uint32_t n_idx = n_block_base + n_off;
+                            float* smem_dst = smem_sfb + k_idx * BLOCK_N + n_off;
+                            if (n_idx + kVec <= shape_n) {
+                                const float* gmem_src = sfb_base +
+                                    k_idx * aligned_shape_n_sfb + n_idx;
+                                ptx::cp_async_16(smem_dst, gmem_src);
+                            } else {
+                                // Tail: at least one element is OOB; use scalar st with 1.0f fill.
+                                float4 vals;
+                                const float* sfb_row = sfb_base + k_idx * aligned_shape_n_sfb + n_idx;
+                                vals.x = (n_idx + 0 < shape_n) ? *(sfb_row + 0) : 1.0f;
+                                vals.y = (n_idx + 1 < shape_n) ? *(sfb_row + 1) : 1.0f;
+                                vals.z = (n_idx + 2 < shape_n) ? *(sfb_row + 2) : 1.0f;
+                                vals.w = (n_idx + 3 < shape_n) ? *(sfb_row + 3) : 1.0f;
+                                ptx::st_shared(reinterpret_cast<float4*>(smem_dst), vals);
+                            }
                         }
                     }
                 } else {
@@ -1029,10 +1051,18 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                         if (n_idx >= shape_n) {
                             ptx::st_shared(smem_dst, 1.0f);
                         } else {
-                            const float* gmem_src = sfb +
-                                current_group_idx * shape_n * shape_k_scales_b +
-                                n_idx * shape_k_scales_b + k_idx;
-                            ptx::cp_async_4(smem_dst, gmem_src);
+                            if constexpr (kScaleBBF16) {
+                                const auto* sfb_bf16 = reinterpret_cast<const nv_bfloat16*>(sfb);
+                                const auto* gmem_src = sfb_bf16 +
+                                    current_group_idx * shape_n * shape_k_scales_b +
+                                    n_idx * shape_k_scales_b + k_idx;
+                                ptx::st_shared(smem_dst, __bfloat162float(*gmem_src));
+                            } else {
+                                const float* gmem_src = sfb +
+                                    current_group_idx * shape_n * shape_k_scales_b +
+                                    n_idx * shape_k_scales_b + k_idx;
+                                ptx::cp_async_4(smem_dst, gmem_src);
+                            }
                         }
                     }
                 }
