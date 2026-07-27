@@ -89,8 +89,8 @@ public:
         // Group128 BF16 masked partial tile: directly store valid rows from
         // final_accum and skip STSM -> smem_d -> scalar copy-back.
         bool g128_fast_partial_store;
-        // 0: disabled, 1: L2, 2: L1. Issued by the elected TMA producer.
-        uint32_t g128_scale_b_prefetch_mode;
+        // Issued by the elected TMA producer.
+        bool g128_scale_b_l2_prefetch;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -272,7 +272,7 @@ static void __instantiate_kernel() {{
         args.scale_b_e8m0 ? "true" : "false",
         args.reorder_masked_by_max_m ? "true" : "false",
         args.g128_fast_partial_store ? "true" : "false",
-        args.g128_scale_b_prefetch_mode);
+        args.g128_scale_b_l2_prefetch ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
