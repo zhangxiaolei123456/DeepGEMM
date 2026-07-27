@@ -86,6 +86,9 @@ public:
         // 仅在 compact_masked_sched 开启时生效，让 wave 0 优先吃重 group，
         // 减少 last-wave imbalance。host 默认关。
         bool reorder_masked_by_max_m;
+        // Group128 BF16 masked partial tile: directly store valid rows from
+        // final_accum and skip STSM -> smem_d -> scalar copy-back.
+        bool g128_fast_partial_store;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -113,6 +116,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -263,7 +267,8 @@ static void __instantiate_kernel() {{
         args.b_is_int4_sym ? "true" : "false",
         args.scale_b_bf16 ? "true" : "false",
         args.scale_b_e8m0 ? "true" : "false",
-        args.reorder_masked_by_max_m ? "true" : "false");
+        args.reorder_masked_by_max_m ? "true" : "false",
+        args.g128_fast_partial_store ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

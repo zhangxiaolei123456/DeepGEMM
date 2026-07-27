@@ -690,7 +690,8 @@ template <cute::UMMA::Major kMajorSFB,
           bool kBIsInt4Sym = false,
           bool kScaleBBF16 = false,
           bool kScaleBE8M0 = false,
-          bool kReorderMaskedByMaxM = false>
+          bool kReorderMaskedByMaxM = false,
+          bool kFastPartialMaskedStore = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -3035,6 +3036,46 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                 // Guarded scalar copy-back is only needed for partial masked tiles.
                 if (not scheduler.is_computation_valid(m_block_idx, BLOCK_M - 1)) {
                     const uint32_t global_m_base = scheduler.template get_global_idx<true>(shape_m, BLOCK_M, m_block_idx);
+                    if constexpr (kFastPartialMaskedStore) {
+                        #pragma unroll
+                        for (uint32_t local_idx = kParallelNWavesEnabled ? wave_group_idx : 0;
+                             local_idx < WAVE_WGMMA;
+                             local_idx += kParallelNWavesEnabled ? WAVE_WGMMA : 1) {
+                            const uint32_t n_offset = local_idx * WAVE_BLOCK_M;
+                            auto shifted_accum = final_accum + kFinalAccumStride * local_idx;
+                            constexpr uint32_t kDirectStoreIters =
+                                BLOCK_M < WGMMA::M ? math::constexpr_ceil_div(BLOCK_M, 8u) : WGMMA::kNumAccum / 4;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kDirectStoreIters; ++ i) {
+                                const uint32_t local_m_0 = i * 8 + col_idx * 2;
+                                const uint32_t local_m_1 = local_m_0 + 1;
+                                const uint32_t col_0 = epilogue_type_t::template apply_index_n<1>(
+                                    n_block_idx * BLOCK_N + n_offset + r_0);
+                                const uint32_t col_1 = epilogue_type_t::template apply_index_n<1>(
+                                    n_block_idx * BLOCK_N + n_offset + r_1);
+                                const bool row_0_valid = scheduler.is_computation_valid(m_block_idx, local_m_0);
+                                const bool row_1_valid = scheduler.is_computation_valid(m_block_idx, local_m_1);
+                                auto direct_store = [&](bool row_valid, uint32_t local_m, uint32_t col, uint32_t accum_idx) {
+                                    if (row_valid and col < shape_n) {
+                                        const nv_bfloat16 out = __float2bfloat16_rn(
+                                            fp4_rs_detail::final_accum_load_scalar<kBF16FinalAccum>(shifted_accum, accum_idx));
+                                        if constexpr (kTMAStoreStub) {
+                                            const uint32_t sink = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&out));
+                                            asm volatile("" :: "r"(sink) : "memory");
+                                        } else {
+                                            gmem_d_ptr[(global_m_base + local_m) * shape_n + col] = out;
+                                        }
+                                    }
+                                };
+                                direct_store(row_0_valid, local_m_0, col_0, i * 4 + 0);
+                                direct_store(row_1_valid, local_m_1, col_0, i * 4 + 1);
+                                direct_store(row_0_valid, local_m_0, col_1, i * 4 + 2);
+                                direct_store(row_1_valid, local_m_1, col_1, i * 4 + 3);
+                            }
+                        }
+                        __syncwarp();
+                        continue;
+                    }
                     #pragma unroll
                     for (uint32_t local_idx = kParallelNWavesEnabled ? wave_group_idx : 0;
                          local_idx < WAVE_WGMMA;
