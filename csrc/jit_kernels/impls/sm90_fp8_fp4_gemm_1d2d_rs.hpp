@@ -73,9 +73,6 @@ public:
         // 配合 fuse_scale_b_decode：sfb 物理布局是 [groups, K/32/4, N]（MN-major + 4 个
         // e8m0 打包成 1 个 int32），体积 = fp32 的 1/4。需 sfb.scalar_type() == kInt。
         bool scale_b_packed_ue8m0;
-        // Group128 BF16 direct-load: move SFb load/product after WGMMA issue and
-        // before wait so it can overlap the async WGMMA latency.
-        bool g128_bf16_delay_sfb_load;
         uint32_t scale_b_gran_k;
         // INT4-sym (signed [-8, 7] packed two nibbles/byte) variant for B.
         // Path-A: per-128 fp32 SFB, no fused-decode. See kernel header.
@@ -209,7 +206,7 @@ static void __instantiate_kernel() {{
         "false",
         "false",
         args.scale_b_pow2_promote ? "true" : "false",
-        args.g128_bf16_delay_sfb_load ? "true" : "false",
+        "false",
         "false",
         args.scale_b_direct_load ? "true" : "false",
         "false",
