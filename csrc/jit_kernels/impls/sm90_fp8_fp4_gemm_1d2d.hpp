@@ -1255,11 +1255,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         (gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
          not fuse_scale_b_decode) or
         g128_bf16_direct_load;
-    // Group128 packed-B cooperative load: adjacent lanes consume opposite
-    // 16-bit halves of the same word, so one ld.shared plus shfl replaces two
-    // identical shared loads. Keep an explicit rollback switch for A/B.
-    const bool decode_pair_shfl =
-        gran_k_b == 128 and env_int("DG_W4_G128_DECODE_PAIR_SHFL", 1) != 0;
     const bool k32_quad_reduce =
         gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
         not fuse_scale_b_decode;
@@ -1392,7 +1387,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .major_sfb = get_major_type_ab(sfb),
         .scale_b_direct_load = scale_b_direct_load,
         .scale_b_pow2_promote = scale_b_pow2_promote,
-        .decode_pair_shfl = decode_pair_shfl,
         .k32_quad_reduce = k32_quad_reduce,
         .k32_pair_reduce = k32_pair_reduce,
         .k32_bf16_final_accum = k32_bf16_final_accum,
