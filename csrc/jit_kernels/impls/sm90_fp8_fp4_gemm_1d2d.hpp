@@ -652,6 +652,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         sfb.scalar_type() == torch::kBFloat16 and
         not env_disabled("DG_W4_SCALE_B_BF16") and
         env_int("DG_W4_G128_BF16_DIRECT_LOAD", 1) != 0;
+    const bool g128_bf16_delay_sfb_load =
+        g128_bf16_direct_load and env_int("DG_W4_G128_BF16_DELAY_SFB_LOAD", 1) != 0;
     // BM=64 fast-path 是否启用（函数作用域统一判据，供三处共用：layout 选择 /
     // bm32_skew_layout(stages) / bm32_skew_fast_path(device 三件套总闸)）。
     //   两个触发源：
@@ -1395,6 +1397,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .scale_a_stub = scale_a_stub,
         .fuse_predecode_pair = fuse_predecode_pair,
         .scale_b_packed_ue8m0 = scale_b_packed_ue8m0,
+        .g128_bf16_delay_sfb_load = g128_bf16_delay_sfb_load,
         .scale_b_gran_k = static_cast<uint32_t>(gran_k_b),
         .b_is_int4_sym = b_is_int4_sym,
         .scale_b_bf16 = scale_b_bf16,

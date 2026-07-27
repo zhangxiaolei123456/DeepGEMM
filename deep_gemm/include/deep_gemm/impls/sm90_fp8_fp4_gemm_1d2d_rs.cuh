@@ -1525,9 +1525,13 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                             const bool should_promote_group =
                                 (not kUseScaleKGroup) or (scale_group_pos == kScaleKGroup - 1) or
                                 (k_block_idx + 1 == num_total_k_blocks);
+                            constexpr bool kDelayG128BF16SFBLoad =
+                                kScaleBGranK == 128 and kScaleBDirectLoad and
+                                kScaleBBF16 and kScaleBEarlyLoad;
 
-                            // Read scales before `warpgroup_arrive` so the next CTA cannot pollute shared memory.
-                            // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                            // SFA reads must happen before releasing the pipeline stage.
+                            // For group128 BF16 direct-load, SFB comes from gmem and can
+                            // be delayed until after WGMMA issue to hide part of its latency.
                             const uint32_t compute_n_0 = n_block_idx * BLOCK_N + m_offset + r_0;
                             const uint32_t compute_n_1 = n_block_idx * BLOCK_N + m_offset + r_1;
                             float scale_b_0 = 0.0f;
@@ -1537,7 +1541,7 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                     if constexpr (kScaleBStub) {
                                         scale_b_0 = 1.0f;
                                         scale_b_1 = 1.0f;
-                                    } else {
+                                    } else if constexpr (not kDelayG128BF16SFBLoad) {
                                         scale_b_0 = load_sfb(compute_n_0, k_block_idx);
                                         scale_b_1 = load_sfb(compute_n_1, k_block_idx);
                                     }
@@ -2816,6 +2820,23 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                         load_a_regs(k + 1, a_regs);
                                 }
                             }
+                            if constexpr (not kWGMMAStub and kDelayG128BF16SFBLoad) {
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(accum[i]);
+                            }
+                            if constexpr (kDelayG128BF16SFBLoad) {
+                                if (do_wgmma_store and (should_promote_group or kUseScaleKGroup)) {
+                                    if constexpr (kScaleBStub) {
+                                        scale_b_0 = 1.0f;
+                                        scale_b_1 = 1.0f;
+                                    } else {
+                                        scale_b_0 = load_sfb(compute_n_0, k_block_idx);
+                                        scale_b_1 = load_sfb(compute_n_1, k_block_idx);
+                                    }
+                                }
+                            }
                             float scale_0_0_regs[kFusedPromote ? 1 : WGMMA::kNumAccum / 4];
                             float scale_1_0_regs[kFusedPromote ? 1 : WGMMA::kNumAccum / 4];
                             float scale_0_1_regs[kFusedPromote ? 1 : WGMMA::kNumAccum / 4];
@@ -2875,10 +2896,12 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                 }
                             }
                             if constexpr (not kWGMMAStub) {
-                                ptx::warpgroup_commit_batch();
-                                #pragma unroll
-                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                                    ptx::warpgroup_fence_operand(accum[i]);
+                                if constexpr (not kDelayG128BF16SFBLoad) {
+                                    ptx::warpgroup_commit_batch();
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(accum[i]);
+                                }
                             }
 
                             const bool is_last_wave = (local_idx == WAVE_WGMMA - 1);
