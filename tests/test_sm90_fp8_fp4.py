@@ -674,7 +674,7 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
     print(
         "DeepSeek Pro EP32 decode group128 B scale case: "
         "hidden=7168, intermediate=3072, experts=384, topk=6, "
-        "local_groups=12, routed_tokens=8*6=48, "
+        "local_groups=12, decode_batch=1/4/8/16/32, "
         "b.second shape = [local_groups, N, K/128]"
     )
 
@@ -684,15 +684,39 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
         ("down", 7168, 3072),
     ]
     distributions = [
-        # EP32 => 384 / 32 = 12 local experts. Decode running-req=8,
-        # topk=6 gives 48 routed expert assignments, so the uniform average
-        # is 4 tokens per local expert.
+        # Batch sweep: EP32 gives 12 local experts and topk=6 gives
+        # batch_size * 6 routed assignments per rank.
+        ("bs1_sparse_a6", values_from_active([1] * 6), 1),
+        ("bs4_uniform_2", [2] * 12, 2),
         ("uniform_4", [4] * 12, 4),
-        # Mild and heavy skew variants keep the same 48 routed assignments
-        # but cover realistic router imbalance around the decode hot expert.
+        ("bs16_uniform_8", [8] * 12, 8),
+        ("bs32_uniform_16", [16] * 12, 16),
+        # Same 48 assignments as batch=8, with progressively fewer active
+        # experts. These cover generic-scheduler M-block fan-out without hints.
+        ("six_hot_8", values_from_active([8] * 6), 4),
+        ("four_hot_12", values_from_active([12] * 4), 4),
+        ("two_hot_24", values_from_active([24] * 2), 4),
+        ("one_hot_48", values_from_active([48]), 4),
         ("skew_hot12", values_from_active([12, 8, 6, 4, 4, 3, 3, 2, 2, 2, 1, 1]), 4),
         ("skew_hot24", values_from_active([24, 8, 4, 3, 2, 2, 1, 1, 1, 1, 1]), 4),
+        ("skew_hot32", values_from_active([32, 8, 4, 2, 1, 1]), 4),
+        # Larger decode batches retain dense tails while introducing hotter
+        # experts around the BM32/BM64 transition.
+        (
+            "bs16_skew_hot48",
+            values_from_active([48, 16, 8, 6, 4, 4, 3, 2, 2, 1, 1, 1]),
+            8,
+        ),
+        (
+            "bs32_skew_hot96",
+            values_from_active([96, 32, 16, 12, 8, 8, 6, 4, 4, 2, 2, 2]),
+            16,
+        ),
     ]
+    for _, masked_m_values, expected_m in distributions:
+        assert expected_m == (sum(masked_m_values) + 11) // 12
+        assert max(masked_m_values) <= 128
+
     for shape_name, n, k in shapes:
         for dist_name, masked_m_values, expected_m in distributions:
             for pass_hints, suffix in ((True, ""), (False, "_no_hint")):
