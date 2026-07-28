@@ -1016,14 +1016,24 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                 }
             } else {
                 // path-A (gran_k_b=128): BF16 SFB direct-load by default.
-                // BM=8/16 keeps BN=256 to minimize CTA count. BM=32 uses BN=128
-                // to halve the two-wave final-accum footprint and reduce register
-                // pressure; set DG_W4_G128_BM32_BN128=0 to restore BN=256.
+                // Without caller hints, use expected_m buckets by default:
+                //   expected_m <= 8  -> BM8
+                //   expected_m <= 16 -> BM16
+                //   expected_m <= 32 -> BM32
+                // Set DG_W4_G128_NOHINT_BUCKET=0 to force no-hint calls to
+                // BM8+BN256 for A/B testing against the bucket policy.
+                // BM=32 uses BN=128 to halve the two-wave final-accum footprint
+                // and reduce register pressure; set DG_W4_G128_BM32_BN128=0 to
+                // restore BN=256.
                 // BLOCK_K is fixed at 128 by the device kernel.
-                if (bm_select_m <= 8) layout.block_m = 8;
-                else if (bm_select_m <= 16) layout.block_m = 16;
-                else if (bm_select_m <= 32) layout.block_m = 32;
-                else if (bm_select_m <= 64) layout.block_m = 64;
+                const bool g128_nohint_bucket =
+                    masked_m_max_hint.has_value() or
+                    env_int("DG_W4_G128_NOHINT_BUCKET", 1) != 0;
+                const int g128_select_m = g128_nohint_bucket ? bm_select_m : 8;
+                if (g128_select_m <= 8) layout.block_m = 8;
+                else if (g128_select_m <= 16) layout.block_m = 16;
+                else if (g128_select_m <= 32) layout.block_m = 32;
+                else if (g128_select_m <= 64) layout.block_m = 64;
                 layout.block_n = 256;
 
                 // DSV4 + small hot (bm_select∈(32,64])：BM=64 padding 浪费太大，
