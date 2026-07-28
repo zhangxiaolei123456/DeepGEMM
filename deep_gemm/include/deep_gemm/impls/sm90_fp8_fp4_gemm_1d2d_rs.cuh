@@ -692,8 +692,7 @@ template <cute::UMMA::Major kMajorSFB,
           bool kScaleBE8M0 = false,
           bool kReorderMaskedByMaxM = false,
           bool kFastPartialMaskedStore = false,
-          bool kScaleBL2Prefetch = false,
-          bool kMBlockBReuse = false>
+          bool kScaleBL2Prefetch = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -721,11 +720,6 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      (kScaleBDirectLoad and kScaleBGranK == 128 and kScaleBBF16 and
                       kMajorSFB == cute::UMMA::Major::MN),
                      "Scale-B prefetch only supports group128 BF16 MN-major direct-load");
-    DG_STATIC_ASSERT(not kMBlockBReuse or
-                     (kGemmType == GemmType::MGroupedMasked and kScaleBGranK == 128 and
-                      (BLOCK_M == 8 or BLOCK_M == 16) and BLOCK_N == 256 and
-                      kNumTMAMulticast == 1),
-                     "M-block B reuse only supports group128 masked BM8/16 BN256");
     DG_STATIC_ASSERT(not kScaleBE8M0 or (kScaleBDirectLoad and kScaleBGranK == 32),
                      "E8M0 Scale-B is only supported by direct-load per-32 path");
     DG_STATIC_ASSERT(not kScaleBBF16 or kScaleBGranK == 128 or
@@ -871,49 +865,10 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
     uint32_t simple_sched_linear_idx = blockIdx.x;
-    uint32_t reuse_task_idx = blockIdx.x;
-    uint32_t reuse_next_m_block = 0;
-    uint32_t reuse_end_m_block = 0;
-    bool reuse_packed_b = false;
     constexpr bool kUseSmallMSimpleSched =
         kSmallMSimpleSched and kGemmType == GemmType::MGroupedMasked and BLOCK_M <= 8 and kNumTMAMulticast == 1;
     auto get_next_block = [&]() {
-        if constexpr (kMBlockBReuse) {
-            if (reuse_next_m_block < reuse_end_m_block) {
-                m_block_idx = reuse_next_m_block ++;
-                reuse_packed_b = true;
-                return true;
-            }
-
-            constexpr uint32_t kMBlocksPerChunk = 2;
-            const uint32_t max_m_blocks = math::ceil_div(shape_m, BLOCK_M);
-            const uint32_t max_chunks = math::ceil_div(max_m_blocks, kMBlocksPerChunk);
-            const uint32_t tasks_per_group = scheduler.num_n_blocks * max_chunks;
-            const uint32_t total_tasks = kNumGroups * tasks_per_group;
-            while (reuse_task_idx < total_tasks) {
-                const uint32_t task_idx = reuse_task_idx;
-                reuse_task_idx += gridDim.x;
-
-                const uint32_t group_idx = task_idx / tasks_per_group;
-                const uint32_t in_group_idx = task_idx - group_idx * tasks_per_group;
-                n_block_idx = in_group_idx / max_chunks;
-                const uint32_t chunk_idx = in_group_idx - n_block_idx * max_chunks;
-                const uint32_t first_m_block = chunk_idx * kMBlocksPerChunk;
-                const uint32_t group_m = static_cast<uint32_t>(__ldg(grouped_layout + group_idx));
-                const uint32_t num_m_blocks = math::ceil_div(group_m, BLOCK_M);
-                if (first_m_block >= num_m_blocks)
-                    continue;
-
-                scheduler.current_group_idx = group_idx;
-                scheduler.num_m_blocks = num_m_blocks;
-                m_block_idx = first_m_block;
-                reuse_next_m_block = first_m_block + 1;
-                reuse_end_m_block = min(first_m_block + kMBlocksPerChunk, num_m_blocks);
-                reuse_packed_b = false;
-                return true;
-            }
-            return false;
-        } else if constexpr (kUseSmallMSimpleSched) {
+        if constexpr (kUseSmallMSimpleSched) {
             const uint32_t n_blocks = math::ceil_div(shape_n, BLOCK_N);
             const uint32_t total_blocks = n_blocks * kNumGroups;
             while (simple_sched_linear_idx < total_blocks) {
@@ -989,39 +944,33 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
 
                     if constexpr (not kWeightStub) {
                         // Issue TMA B (packed FP4 bytes loaded as raw uint8 via FP8 alias) on the same barrier.
-                        if (not reuse_packed_b) {
-                            const uint32_t k_idx_packed = k_block_idx * BLOCK_K_PACKED;
-                            tma::copy<BLOCK_K_PACKED, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
-                                     reinterpret_cast<__nv_fp8_e4m3*>(smem_b_packed[stage_idx]),
-                                     k_idx_packed,
-                                     scheduler.template get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                                     num_tma_multicast_b, batch_idx);
-                        }
+                        const uint32_t k_idx_packed = k_block_idx * BLOCK_K_PACKED;
+                        tma::copy<BLOCK_K_PACKED, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
+                                 reinterpret_cast<__nv_fp8_e4m3*>(smem_b_packed[stage_idx]),
+                                 k_idx_packed,
+                                 scheduler.template get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                                 num_tma_multicast_b, batch_idx);
                     }
 
                     if constexpr (kScaleBL2Prefetch) {
-                        if (not reuse_packed_b) {
-                            const uint32_t n_base = n_block_idx * BLOCK_N;
-                            const uint32_t valid_n = min(BLOCK_N, shape_n - n_base);
-                            const uint32_t sfb_offset =
-                                get_current_group_idx() * aligned_shape_n_sfb * shape_k_scales_b +
-                                k_block_idx * aligned_shape_n_sfb + n_base;
-                            auto* sfb_bf16 = reinterpret_cast<nv_bfloat16*>(sfb) + sfb_offset;
-                            constexpr uint32_t kPrefetchBytes = 128;
-                            for (uint32_t byte_offset = 0;
-                                 byte_offset < valid_n * sizeof(nv_bfloat16);
-                                 byte_offset += kPrefetchBytes) {
-                                void* ptr = reinterpret_cast<uint8_t*>(sfb_bf16) + byte_offset;
-                                ptx::prefetch_l2(ptr);
-                            }
+                        const uint32_t n_base = n_block_idx * BLOCK_N;
+                        const uint32_t valid_n = min(BLOCK_N, shape_n - n_base);
+                        const uint32_t sfb_offset =
+                            get_current_group_idx() * aligned_shape_n_sfb * shape_k_scales_b +
+                            k_block_idx * aligned_shape_n_sfb + n_base;
+                        auto* sfb_bf16 = reinterpret_cast<nv_bfloat16*>(sfb) + sfb_offset;
+                        constexpr uint32_t kPrefetchBytes = 128;
+                        for (uint32_t byte_offset = 0;
+                             byte_offset < valid_n * sizeof(nv_bfloat16);
+                             byte_offset += kPrefetchBytes) {
+                            void* ptr = reinterpret_cast<uint8_t*>(sfb_bf16) + byte_offset;
+                            ptx::prefetch_l2(ptr);
                         }
                     }
 
-                    const uint32_t expected_b_bytes =
-                        (kWeightStub or reuse_packed_b) ? 0 : SMEM_B_PACKED_SIZE_PER_STAGE;
-                    const uint32_t kExpectedTxBytes = SMEM_A_TMA_SIZE_PER_STAGE +
-                                                      expected_b_bytes +
-                                                      (kScaleAStub ? 0 : SMEM_SFA_TMA_SIZE_PER_STAGE);
+                    constexpr uint32_t kExpectedTxBytes = SMEM_A_TMA_SIZE_PER_STAGE +
+                                                          (kWeightStub ? 0 : SMEM_B_PACKED_SIZE_PER_STAGE) +
+                                                          (kScaleAStub ? 0 : SMEM_SFA_TMA_SIZE_PER_STAGE);
                     full_barrier.arrive_and_expect_tx(kExpectedTxBytes);
                 }
             }
