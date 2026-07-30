@@ -675,12 +675,15 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
         "DeepSeek Pro EP32 decode group128 B scale case: "
         "hidden=7168, intermediate=3072, experts=384, topk=6, "
         "local_groups=12, decode_batch=1/4/8/16/32, "
-        "b.second shape = [local_groups, N, K/128]"
+        "shapes=gateup/up/down, b.second shape = [local_groups, N, K/128]"
     )
 
     rows = []
     shapes = [
+        # SGLang uses fused gateup in the real MoE path, but keep the standalone
+        # up shape to isolate the half-width projection from the fused N=6144 case.
         ("gateup", 6144, 7168),
+        ("up", 3072, 7168),
         ("down", 7168, 3072),
     ]
     distributions = [
