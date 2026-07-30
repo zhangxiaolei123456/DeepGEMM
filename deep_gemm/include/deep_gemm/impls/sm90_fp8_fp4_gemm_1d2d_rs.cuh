@@ -693,7 +693,8 @@ template <cute::UMMA::Major kMajorSFB,
           bool kReorderMaskedByMaxM = false,
           bool kFastPartialMaskedStore = false,
           bool kScaleBL2Prefetch = false,
-          bool kScaleBStageTMA = false>
+          bool kScaleBStageTMA = false,
+          uint32_t kMaskedMPartition = 0>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -718,6 +719,11 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      "DG_W4_SCALE_K_GROUP only supports 1/2/4");
     DG_STATIC_ASSERT(not kBIsInt4Sym, "RS-mode FP8xFP4 kernel does not support INT4-sym B");
     DG_STATIC_ASSERT(not (kScaleBBF16 and kScaleBE8M0), "Scale-B cannot be both BF16 and E8M0");
+    DG_STATIC_ASSERT(kMaskedMPartition <= 2, "Invalid masked-M partition");
+    DG_STATIC_ASSERT(kMaskedMPartition == 0 or kGemmType == GemmType::MGroupedMasked,
+                     "Masked-M partition requires masked grouped GEMM");
+    DG_STATIC_ASSERT(kMaskedMPartition == 0 or kScaleBStageTMA,
+                     "Masked-M partition requires group128 Scale-B stage TMA");
     DG_STATIC_ASSERT(not kScaleBL2Prefetch or
                      (kScaleBDirectLoad and kScaleBGranK == 128 and kScaleBBF16 and
                       kMajorSFB == cute::UMMA::Major::MN),
@@ -886,6 +892,17 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     uint32_t simple_sched_linear_idx = blockIdx.x;
     constexpr bool kUseSmallMSimpleSched =
         kSmallMSimpleSched and kGemmType == GemmType::MGroupedMasked and BLOCK_M <= 8 and kNumTMAMulticast == 1;
+    auto is_current_group_selected = [&]() {
+        if constexpr (kMaskedMPartition == 0) {
+            return true;
+        } else {
+            const uint32_t group_m = __ldg(grouped_layout + scheduler.current_group_idx);
+            if constexpr (kMaskedMPartition == 1)
+                return group_m <= 8;
+            else
+                return group_m > 8;
+        }
+    };
     auto get_next_block = [&]() {
         if constexpr (kUseSmallMSimpleSched) {
             const uint32_t n_blocks = math::ceil_div(shape_n, BLOCK_N);
@@ -895,12 +912,17 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                 n_block_idx = simple_sched_linear_idx - scheduler.current_group_idx * n_blocks;
                 m_block_idx = 0;
                 simple_sched_linear_idx += gridDim.x;
-                if (scheduler.is_computation_valid(m_block_idx, 0))
+                if (scheduler.is_computation_valid(m_block_idx, 0) and
+                    is_current_group_selected())
                     return true;
             }
             return false;
         } else {
-            return scheduler.get_next_block(m_block_idx, n_block_idx);
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if (is_current_group_selected())
+                    return true;
+            }
+            return false;
         }
     };
     auto get_current_group_idx = [&]() {
