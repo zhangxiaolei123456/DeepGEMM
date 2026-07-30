@@ -474,6 +474,8 @@ def _masked_skew_benchmark_case(
             gran_k=a_gran_k,
             gran_k_a=a_gran_k,
             gran_k_b=b_gran_k,
+            block_m_override=block_m_override,
+            block_n_override=block_n_override,
             masked_m_max_hint=masked_m_max_hint,
             active_groups_hint=active_groups_hint,
         )
