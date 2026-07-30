@@ -93,8 +93,6 @@ public:
         bool g128_scale_b_l2_prefetch;
         // Stage BF16 SFB with TMA and make it part of the A/B/SFA full barrier.
         bool g128_scale_b_stage_tma;
-        // 0: all groups, 1: masked_m <= 8, 2: masked_m > 8.
-        uint32_t masked_m_partition;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -123,7 +121,6 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {},
         {},
         {},
         {},
@@ -280,8 +277,7 @@ static void __instantiate_kernel() {{
         args.reorder_masked_by_max_m ? "true" : "false",
         args.g128_fast_partial_store ? "true" : "false",
         args.g128_scale_b_l2_prefetch ? "true" : "false",
-        args.g128_scale_b_stage_tma ? "true" : "false",
-        args.masked_m_partition);
+        args.g128_scale_b_stage_tma ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

@@ -517,7 +517,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
     SM90FP8FP4Gemm1D2DRuntime::launch(runtime, args);
 }
 
-static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
+static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const std::pair<torch::Tensor, torch::Tensor>& a,
         const std::pair<torch::Tensor, torch::Tensor>& b,
         const torch::Tensor& d,
@@ -534,22 +534,21 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
         // with packed-FP4 (2 nibbles/byte, kPackedFP4 dtype, fp32 SFB), so
         // the kernel reuses the same TMA descriptors and SFB layout. Only
         // the in-register decode primitive switches to int4_symx4_to_e4m3x4.
-        const bool& b_is_int4_sym,
+        const bool& b_is_int4_sym = false,
         // DSV4 MTP/speculative-verify hint: caller passes masked_m.max() so
         // the host can pick BM matching the hottest group instead of the
         // distribution-average expected_m. Fast-path gating (k32 quad_reduce
         // / direct_load / compact_sched) still keys on expected_m so existing
         // small-M optimizations are preserved. Defaults to expected_m when
         // unset.
-        const std::optional<int>& masked_m_max_hint,
+        const std::optional<int>& masked_m_max_hint = std::nullopt,
         // active_groups_hint: caller passes count of groups with masked_m > 0
         // (i.e. (masked_m != 0).sum()). Combined with masked_m_max_hint this
         // is enough to estimate "工作量分布" and decide fast-path 是否合适：
         //   * 单热点 / 极少活跃 group → fast-path (BM=32 BN=128) 大胜
         //   * 大量活跃 group + 高 max_m → fan-out (BM 阶梯, BN=256) 取胜
         // 不传时退化为旧行为（仅看 max_hint）。
-        const std::optional<int>& active_groups_hint,
-        const uint32_t masked_m_partition) {
+        const std::optional<int>& active_groups_hint = std::nullopt) {
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
     const int gran_k_a_requested = gran_k_a_override.value_or(gran_k);
     const int gran_k_b_requested = gran_k_b_override.value_or(gran_k);
@@ -658,8 +657,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
         g128_bf16_direct_load and
         get_major_type_ab(sfb) == cute::UMMA::Major::MN and
         env_int("DG_W4_G128_SFB_TMA", 1) != 0;
-    DG_HOST_ASSERT(masked_m_partition <= 2);
-    DG_HOST_ASSERT(masked_m_partition == 0 or g128_scale_b_stage_tma);
     const bool g128_fast_partial_store =
         g128_bf16_direct_load and env_int("DG_W4_G128_FAST_PARTIAL_STORE", 1) != 0;
     // BM=64 fast-path 是否启用（函数作用域统一判据，供三处共用：layout 选择 /
@@ -1207,15 +1204,14 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
     if (g128_bf16_direct_load and env_int("DG_W4_G128_PRINT_CONFIG", 0) != 0) {
         printf(
             "[g128-config] stage_tma=%d block_m=%d block_n=%d block_k=%d "
-            "num_stages=%d smem_bytes=%d threads=%d partition=%u\n",
+            "num_stages=%d smem_bytes=%d threads=%d\n",
             static_cast<int>(g128_scale_b_stage_tma),
             config.layout.block_m,
             config.layout.block_n,
             config.layout.block_k,
             config.pipeline_config.num_stages,
             config.pipeline_config.smem_size,
-            config.launch_config.num_threads,
-            masked_m_partition);
+            config.launch_config.num_threads);
     }
 
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a.first, m, k,
@@ -1357,9 +1353,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
         k32_quad_reduce and not k32_quad_split_promote and
         env_enabled("DG_W4_K32_QUAD_PAIR4X2_PROMOTE");
     // small_m_simple_sched: device 端固定 m_block_idx=0，因此只有 caller
-    // 明确提供 max_m<=8，或 cold partition 已过滤出 masked_m<=8 的 group
-    // 时才安全。expected_m 只是分布均值；无上述保证时可能存在 hot group，
-    // 必须回退通用 masked scheduler 覆盖后续 M blocks。
+    // 明确提供 max_m<=8 时才安全。expected_m 只是分布均值；hint 缺失时
+    // 可能存在 hot group，必须回退通用 masked scheduler 覆盖后续 M blocks。
     // 默认守护 (k>=4096 + n<=4096) 来自历史 g32 + n=4096 dsv4 形状的保守覆盖。
     // 放开到 RELAX 形状集 (g>=8 + n∈{4096,6144,7168} + k∈{2048,3072,4096,7168})
     // 让 DSV4 EP 业务真实 shape (g24 + n∈{6144,7168} + k∈{3072,7168} + expected_m=1/2/3)
@@ -1367,19 +1362,18 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
     const int small_m_sched_m = std::max(
         expected_m, masked_m_max_hint.value_or(expected_m));
     const bool small_m_simple_sched =
-        masked_m_partition == 1 or
-        (masked_m_max_hint.has_value() and
-         (gran_k_b == 32 or gran_k_b == 128) and small_m_sched_m <= 8 and
-         ((static_cast<int64_t>(desc.k) >= 4096 and static_cast<int64_t>(desc.n) <= 4096) or
-          (static_cast<int64_t>(desc.num_groups) >= 8 and
-           static_cast<int64_t>(desc.num_groups) <= 36 and
-           (static_cast<int64_t>(desc.n) == 4096 or
-            static_cast<int64_t>(desc.n) == 6144 or
-            static_cast<int64_t>(desc.n) == 7168) and
-           (static_cast<int64_t>(desc.k) == 2048 or
-            static_cast<int64_t>(desc.k) == 3072 or
-            static_cast<int64_t>(desc.k) == 4096 or
-            static_cast<int64_t>(desc.k) == 7168))));
+        masked_m_max_hint.has_value() and
+        (gran_k_b == 32 or gran_k_b == 128) and small_m_sched_m <= 8 and
+        ((static_cast<int64_t>(desc.k) >= 4096 and static_cast<int64_t>(desc.n) <= 4096) or
+         (static_cast<int64_t>(desc.num_groups) >= 8 and
+          static_cast<int64_t>(desc.num_groups) <= 36 and
+          (static_cast<int64_t>(desc.n) == 4096 or
+           static_cast<int64_t>(desc.n) == 6144 or
+           static_cast<int64_t>(desc.n) == 7168) and
+          (static_cast<int64_t>(desc.k) == 2048 or
+           static_cast<int64_t>(desc.k) == 3072 or
+           static_cast<int64_t>(desc.k) == 4096 or
+           static_cast<int64_t>(desc.k) == 7168)));
     const bool compact_masked_sched =
         bm32_skew_fast_path and not env_disabled("DG_W4_COMPACT_MASKED_SCHED");
     // compact_masked_sched 按 m_max 降序遍历 active group（实验性扩展，默认关）：
@@ -1470,7 +1464,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
         .g128_fast_partial_store = g128_fast_partial_store,
         .g128_scale_b_l2_prefetch = g128_scale_b_l2_prefetch,
         .g128_scale_b_stage_tma = g128_scale_b_stage_tma,
-        .masked_m_partition = masked_m_partition,
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .sfb = sfb.data_ptr(),
@@ -1484,57 +1477,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
     const auto code = SM90FP8FP4Gemm1D2DRSRuntime::generate(rs_args);
     const auto runtime = compiler->build("sm90_m_grouped_fp8_fp4_gemm_masked_1d2d_rs_fused", code);
     SM90FP8FP4Gemm1D2DRSRuntime::launch(runtime, rs_args);
-}
-
-static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
-        const std::pair<torch::Tensor, torch::Tensor>& a,
-        const std::pair<torch::Tensor, torch::Tensor>& b,
-        const torch::Tensor& d,
-        const torch::Tensor& masked_m,
-        const int& expected_m,
-        const int& gran_k,
-        const std::optional<int>& gran_k_a_override,
-        const std::optional<int>& gran_k_b_override,
-        const std::string& compiled_dims,
-        const std::optional<int>& block_m_override,
-        const std::optional<int>& block_n_override,
-        const bool& decode_stub,
-        const bool& b_is_int4_sym = false,
-        const std::optional<int>& masked_m_max_hint = std::nullopt,
-        const std::optional<int>& active_groups_hint = std::nullopt) {
-    const auto env_int = [](const char* name, int default_value) {
-        const char* value = std::getenv(name);
-        return (value != nullptr and value[0] != '\0') ? std::atoi(value) : default_value;
-    };
-    const int gran_k_b_requested = gran_k_b_override.value_or(gran_k);
-    // The opt-in split owns both layouts and supersedes caller overrides (including
-    // SGLang's BM16 fallback) while preserving the public API.
-    const bool use_split =
-        env_int("DG_W4_G128_SPLIT_BM", 0) != 0 and
-        env_int("DG_W4_SCALE_B_BF16", 1) != 0 and
-        env_int("DG_W4_G128_BF16_DIRECT_LOAD", 1) != 0 and
-        env_int("DG_W4_G128_SFB_TMA", 1) != 0 and
-        gran_k_b_requested == 128 and
-        b.second.scalar_type() == torch::kBFloat16 and expected_m <= 8 and
-        not decode_stub and not b_is_int4_sym and
-        not masked_m_max_hint.has_value();
-
-    if (use_split) {
-        sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
-            a, b, d, masked_m, expected_m, gran_k, gran_k_a_override,
-            gran_k_b_override, compiled_dims, 8, 256, decode_stub,
-            b_is_int4_sym, masked_m_max_hint, active_groups_hint, 1);
-        sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
-            a, b, d, masked_m, expected_m, gran_k, gran_k_a_override,
-            gran_k_b_override, compiled_dims, 32, 128, decode_stub,
-            b_is_int4_sym, masked_m_max_hint, active_groups_hint, 2);
-        return;
-    }
-
-    sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
-        a, b, d, masked_m, expected_m, gran_k, gran_k_a_override,
-        gran_k_b_override, compiled_dims, block_m_override, block_n_override,
-        decode_stub, b_is_int4_sym, masked_m_max_hint, active_groups_hint, 0);
 }
 
 }  // namespace deep_gemm
