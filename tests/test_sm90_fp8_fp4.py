@@ -676,7 +676,7 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
     print(
         "DeepSeek Pro EP32 decode group128 B scale case: "
         "hidden=7168, intermediate=3072, experts=384, topk=6, "
-        "local_groups=12, decode_batch=1/4/8/16/32, "
+        "local_groups=12, decode_batch=1/4/8/16/24/32/48, "
         "shapes=gateup/up/down, b.second shape = [local_groups, N, K/128]"
     )
 
@@ -695,7 +695,9 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
         ("bs4_uniform_2", [2] * 12, 2),
         ("uniform_4", [4] * 12, 4),
         ("bs16_uniform_8", [8] * 12, 8),
+        ("bs24_uniform_12", [12] * 12, 12),
         ("bs32_uniform_16", [16] * 12, 16),
+        ("bs48_uniform_24", [24] * 12, 24),
         # Same 48 assignments as batch=8, with progressively fewer active
         # experts. These cover generic-scheduler M-block fan-out without hints.
         ("six_hot_8", values_from_active([8] * 6), 4),
@@ -713,9 +715,19 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
             8,
         ),
         (
+            "bs24_skew_hot72",
+            values_from_active([72, 24, 12, 9, 6, 6, 4, 3, 3, 2, 2, 1]),
+            12,
+        ),
+        (
             "bs32_skew_hot96",
             values_from_active([96, 32, 16, 12, 8, 8, 6, 4, 4, 2, 2, 2]),
             16,
+        ),
+        (
+            "bs48_skew_hot128",
+            values_from_active([128, 48, 24, 18, 12, 12, 10, 8, 8, 8, 6, 6]),
+            24,
         ),
     ]
     for _, masked_m_values, expected_m in distributions:
