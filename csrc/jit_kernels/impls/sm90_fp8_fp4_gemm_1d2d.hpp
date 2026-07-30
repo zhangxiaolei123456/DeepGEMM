@@ -534,14 +534,14 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused_impl(
         // with packed-FP4 (2 nibbles/byte, kPackedFP4 dtype, fp32 SFB), so
         // the kernel reuses the same TMA descriptors and SFB layout. Only
         // the in-register decode primitive switches to int4_symx4_to_e4m3x4.
-        const bool& b_is_int4_sym = false,
+        const bool& b_is_int4_sym,
         // DSV4 MTP/speculative-verify hint: caller passes masked_m.max() so
         // the host can pick BM matching the hottest group instead of the
         // distribution-average expected_m. Fast-path gating (k32 quad_reduce
         // / direct_load / compact_sched) still keys on expected_m so existing
         // small-M optimizations are preserved. Defaults to expected_m when
         // unset.
-        const std::optional<int>& masked_m_max_hint = std::nullopt,
+        const std::optional<int>& masked_m_max_hint,
         // active_groups_hint: caller passes count of groups with masked_m > 0
         // (i.e. (masked_m != 0).sum()). Combined with masked_m_max_hint this
         // is enough to estimate "工作量分布" and decide fast-path 是否合适：
