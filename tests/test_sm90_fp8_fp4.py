@@ -681,6 +681,7 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
     )
 
     rows = []
+    case_filter = os.getenv("DG_W4_G128_CASE_FILTER", "")
     shapes = [
         # SGLang uses fused gateup in the real MoE path, but keep the standalone
         # up shape to isolate the half-width projection from the fused N=6144 case.
@@ -737,9 +738,14 @@ def test_sm90_fp8_fp4_masked_deepseek_pro_group128_scale() -> None:
     for shape_name, n, k in shapes:
         for dist_name, masked_m_values, expected_m in distributions:
             for pass_hints, suffix in ((True, ""), (False, "_no_hint")):
+                case_name = (
+                    f"ds_pro_ep32_g128_{shape_name}_{dist_name}{suffix}"
+                )
+                if case_filter and case_filter not in case_name:
+                    continue
                 rows.append(
                     _masked_skew_benchmark_case(
-                        f"ds_pro_ep32_g128_{shape_name}_{dist_name}{suffix}",
+                        case_name,
                         masked_m_values,
                         expected_m=expected_m,
                         n=n,

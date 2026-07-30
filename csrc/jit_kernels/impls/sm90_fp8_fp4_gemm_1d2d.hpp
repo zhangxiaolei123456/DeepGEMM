@@ -657,6 +657,20 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         g128_bf16_direct_load and
         get_major_type_ab(sfb) == cute::UMMA::Major::MN and
         env_int("DG_W4_G128_SFB_TMA", 1) != 0;
+    const bool g128_scale_b_stage_tma_alias_a_enabled =
+        g128_scale_b_stage_tma and
+        env_int("DG_W4_G128_SFB_TMA_ALIAS_A", 0) != 0;
+    auto can_alias_g128_scale_b_stage_tma_in_a = [&](const Layout& candidate) {
+        if (not g128_scale_b_stage_tma_alias_a_enabled)
+            return false;
+        const int padded_block_m = std::max(candidate.block_m, 64);
+        const int a_padding_bytes =
+            (padded_block_m - candidate.block_m) * candidate.block_k *
+            static_cast<int>(c10::elementSize(desc.a_dtype));
+        const int sfb_tma_bytes =
+            align(candidate.block_n * static_cast<int>(sizeof(nv_bfloat16)), 128);
+        return sfb_tma_bytes <= a_padding_bytes;
+    };
     const bool g128_fast_partial_store =
         g128_bf16_direct_load and env_int("DG_W4_G128_FAST_PARTIAL_STORE", 1) != 0;
     // BM=64 fast-path 是否启用（函数作用域统一判据，供三处共用：layout 选择 /
@@ -712,8 +726,11 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             const int smem_sfa_per_stage =
                 align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
             const int packed_per_stage = bn * (block_k / 2);
-            const int sfb_tma_per_stage = g128_scale_b_stage_tma ?
-                align(bn * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
+            const auto candidate = Layout{layout.swap_ab, bm, bn, block_k, 1, 1};
+            const int sfb_tma_per_stage =
+                g128_scale_b_stage_tma and
+                not can_alias_g128_scale_b_stage_tma_in_a(candidate) ?
+                    align(bn * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
             const int merged_per_stage =
                 smem_a_per_stage + smem_sfa_per_stage + packed_per_stage + sfb_tma_per_stage;
             constexpr int kMaxEvaluatedStages = 10;
@@ -1130,8 +1147,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const int smem_a_per_stage = rs_padded_bm * block_k * static_cast<int>(c10::elementSize(desc.a_dtype));
         const int smem_sfa_per_stage =
             align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
-        const int sfb_tma_per_stage = g128_scale_b_stage_tma ?
-            align(block_n * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
+        const int sfb_tma_per_stage =
+            g128_scale_b_stage_tma and
+            not can_alias_g128_scale_b_stage_tma_in_a(config.layout) ?
+                align(block_n * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
         const int merged_per_stage =
             smem_a_per_stage + smem_sfa_per_stage + packed_per_stage + sfb_tma_per_stage;
         const int orig_num_stages = config.pipeline_config.num_stages;
@@ -1201,11 +1220,14 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     }
     config.launch_config.num_math_threads = rs_num_math_threads;
     config.launch_config.num_threads = config.launch_config.num_tma_threads + rs_num_math_threads;
+    const bool g128_scale_b_stage_tma_alias_a =
+        can_alias_g128_scale_b_stage_tma_in_a(config.layout);
     if (g128_bf16_direct_load and env_int("DG_W4_G128_PRINT_CONFIG", 0) != 0) {
         printf(
-            "[g128-config] stage_tma=%d block_m=%d block_n=%d block_k=%d "
+            "[g128-config] stage_tma=%d sfb_alias_a=%d block_m=%d block_n=%d block_k=%d "
             "num_stages=%d smem_bytes=%d threads=%d\n",
             static_cast<int>(g128_scale_b_stage_tma),
+            static_cast<int>(g128_scale_b_stage_tma_alias_a),
             config.layout.block_m,
             config.layout.block_n,
             config.layout.block_k,
@@ -1464,6 +1486,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .g128_fast_partial_store = g128_fast_partial_store,
         .g128_scale_b_l2_prefetch = g128_scale_b_l2_prefetch,
         .g128_scale_b_stage_tma = g128_scale_b_stage_tma,
+        .g128_scale_b_stage_tma_alias_a = g128_scale_b_stage_tma_alias_a,
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .sfb = sfb.data_ptr(),

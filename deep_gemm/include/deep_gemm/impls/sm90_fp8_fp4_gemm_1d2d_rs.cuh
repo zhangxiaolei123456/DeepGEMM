@@ -693,7 +693,8 @@ template <cute::UMMA::Major kMajorSFB,
           bool kReorderMaskedByMaxM = false,
           bool kFastPartialMaskedStore = false,
           bool kScaleBL2Prefetch = false,
-          bool kScaleBStageTMA = false>
+          bool kScaleBStageTMA = false,
+          bool kScaleBStageTMAAliasA = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -726,6 +727,8 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      (kScaleBDirectLoad and kScaleBGranK == 128 and kScaleBBF16 and
                       kMajorSFB == cute::UMMA::Major::MN and not kScaleBL2Prefetch),
                      "Scale-B stage TMA only supports group128 BF16 MN-major direct-load");
+    DG_STATIC_ASSERT(not kScaleBStageTMAAliasA or kScaleBStageTMA,
+                     "Scale-B stage TMA A alias requires Scale-B stage TMA");
     DG_STATIC_ASSERT(not kScaleBE8M0 or (kScaleBDirectLoad and kScaleBGranK == 32),
                      "E8M0 Scale-B is only supported by direct-load per-32 path");
     DG_STATIC_ASSERT(not kScaleBBF16 or kScaleBGranK == 128 or
@@ -755,6 +758,8 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     static constexpr uint32_t SMEM_A_TMA_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE =
         (BLOCK_M < WGMMA::M ? WGMMA::M : BLOCK_M) * BLOCK_K * sizeof(__nv_fp8_e4m3);
+    static constexpr uint32_t SMEM_A_PADDING_SIZE_PER_STAGE =
+        SMEM_A_SIZE_PER_STAGE - SMEM_A_TMA_SIZE_PER_STAGE;
     // Packed FP4 B is loaded by TMA into a separate buffer; each row is BLOCK_K / 2 bytes.
     static constexpr uint32_t BLOCK_K_PACKED = BLOCK_K / 2;
     static constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = BLOCK_N * BLOCK_K_PACKED;
@@ -764,10 +769,15 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
         (BLOCK_M < WGMMA::M ? WGMMA::M : BLOCK_M) * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
-    static constexpr uint32_t SMEM_SFB_TMA_SIZE_PER_STAGE =
+    static constexpr uint32_t SMEM_SFB_TMA_TX_SIZE_PER_STAGE =
         kScaleBStageTMA ? BLOCK_N * sizeof(nv_bfloat16) : 0u;
     static constexpr uint32_t ALIGNED_SMEM_SFB_TMA_SIZE_PER_STAGE =
-        math::constexpr_align(SMEM_SFB_TMA_SIZE_PER_STAGE, 128u);
+        kScaleBStageTMAAliasA ? 0u :
+        math::constexpr_align(SMEM_SFB_TMA_TX_SIZE_PER_STAGE, 128u);
+    DG_STATIC_ASSERT(not kScaleBStageTMAAliasA or
+                     math::constexpr_align(SMEM_SFB_TMA_TX_SIZE_PER_STAGE, 128u) <=
+                         SMEM_A_PADDING_SIZE_PER_STAGE,
+                     "Scale-B stage TMA tile does not fit in A-stage padding");
     static constexpr uint32_t SCALE_B_ELEMENT_SIZE =
         kScaleBE8M0 ? static_cast<uint32_t>(sizeof(uint8_t)) :
         (kScaleBBF16 ? static_cast<uint32_t>(sizeof(nv_bfloat16)) :
@@ -833,8 +843,14 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     constexpr uint32_t SMEM_SFB_TMA_OFFSET =
         SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE;
     auto smem_sfb_tma = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<nv_bfloat16*>(
-            smem_buffer + SMEM_SFB_TMA_OFFSET + i * ALIGNED_SMEM_SFB_TMA_SIZE_PER_STAGE);
+        if constexpr (kScaleBStageTMAAliasA) {
+            return reinterpret_cast<nv_bfloat16*>(
+                reinterpret_cast<uint8_t*>(smem_a[i]) + SMEM_A_TMA_SIZE_PER_STAGE);
+        } else {
+            return reinterpret_cast<nv_bfloat16*>(
+                smem_buffer + SMEM_SFB_TMA_OFFSET +
+                i * ALIGNED_SMEM_SFB_TMA_SIZE_PER_STAGE);
+        }
     });
     constexpr uint32_t SMEM_SFB_OFFSET =
         SMEM_SFB_TMA_OFFSET + kNumStages * ALIGNED_SMEM_SFB_TMA_SIZE_PER_STAGE;
@@ -999,7 +1015,7 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                     constexpr uint32_t kExpectedTxBytes = SMEM_A_TMA_SIZE_PER_STAGE +
                                                           (kWeightStub ? 0 : SMEM_B_PACKED_SIZE_PER_STAGE) +
                                                           (kScaleAStub ? 0 : SMEM_SFA_TMA_SIZE_PER_STAGE) +
-                                                          SMEM_SFB_TMA_SIZE_PER_STAGE;
+                                                          SMEM_SFB_TMA_TX_SIZE_PER_STAGE;
                     full_barrier.arrive_and_expect_tx(kExpectedTxBytes);
                 }
             }
