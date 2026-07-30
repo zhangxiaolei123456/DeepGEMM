@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdio>
 #include <cstdlib>
 
 #include <torch/python.h>
@@ -652,6 +653,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         sfb.scalar_type() == torch::kBFloat16 and
         not env_disabled("DG_W4_SCALE_B_BF16") and
         env_int("DG_W4_G128_BF16_DIRECT_LOAD", 1) != 0;
+    const bool g128_scale_b_stage_tma =
+        g128_bf16_direct_load and
+        get_major_type_ab(sfb) == cute::UMMA::Major::MN and
+        env_int("DG_W4_G128_SFB_TMA", 1) != 0;
     const bool g128_fast_partial_store =
         g128_bf16_direct_load and env_int("DG_W4_G128_FAST_PARTIAL_STORE", 1) != 0;
     // BM=64 fast-path 是否启用（函数作用域统一判据，供三处共用：layout 选择 /
@@ -707,7 +712,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             const int smem_sfa_per_stage =
                 align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
             const int packed_per_stage = bn * (block_k / 2);
-            const int merged_per_stage = smem_a_per_stage + smem_sfa_per_stage + packed_per_stage;
+            const int sfb_tma_per_stage = g128_scale_b_stage_tma ?
+                align(bn * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
+            const int merged_per_stage =
+                smem_a_per_stage + smem_sfa_per_stage + packed_per_stage + sfb_tma_per_stage;
             constexpr int kMaxEvaluatedStages = 10;
             constexpr int kBarrierBytes = 16 * kMaxEvaluatedStages * 2;
             const int fixed = smem_d_bytes + kBarrierBytes + sfb_extra;
@@ -1122,7 +1130,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const int smem_a_per_stage = rs_padded_bm * block_k * static_cast<int>(c10::elementSize(desc.a_dtype));
         const int smem_sfa_per_stage =
             align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
-        const int merged_per_stage = smem_a_per_stage + smem_sfa_per_stage + packed_per_stage;
+        const int sfb_tma_per_stage = g128_scale_b_stage_tma ?
+            align(block_n * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
+        const int merged_per_stage =
+            smem_a_per_stage + smem_sfa_per_stage + packed_per_stage + sfb_tma_per_stage;
         const int orig_num_stages = config.pipeline_config.num_stages;
         const int smem_extra =
             config.pipeline_config.smem_size - orig_num_stages * original_per_stage + smem_d_extra + sfb_extra;
@@ -1190,6 +1201,18 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     }
     config.launch_config.num_math_threads = rs_num_math_threads;
     config.launch_config.num_threads = config.launch_config.num_tma_threads + rs_num_math_threads;
+    if (g128_bf16_direct_load and env_int("DG_W4_G128_PRINT_CONFIG", 0) != 0) {
+        printf(
+            "[g128-config] stage_tma=%d block_m=%d block_n=%d block_k=%d "
+            "num_stages=%d smem_bytes=%d threads=%d\n",
+            static_cast<int>(g128_scale_b_stage_tma),
+            config.layout.block_m,
+            config.layout.block_n,
+            config.layout.block_k,
+            config.pipeline_config.num_stages,
+            config.pipeline_config.smem_size,
+            config.launch_config.num_threads);
+    }
 
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a.first, m, k,
                                               config.storage_config.load_block_m,
@@ -1202,6 +1225,21 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, num_groups, 0);
+    if (g128_scale_b_stage_tma) {
+        const int shape_k_scales_b = ceil_div(static_cast<int>(k), gran_k_b);
+        DG_HOST_ASSERT(sfb.stride(1) == 1);
+        DG_HOST_ASSERT(sfb.stride(0) == sfb.stride(2) * shape_k_scales_b);
+    }
+    const auto tensor_map_sfb = g128_scale_b_stage_tma ?
+        make_tma_2d_desc(
+            sfb,
+            static_cast<int>(sfb.stride(2)),
+            num_groups * ceil_div(static_cast<int>(k), gran_k_b),
+            config.layout.block_n,
+            1,
+            static_cast<int>(sfb.stride(2)),
+            0) :
+        tensor_map_sfa;
     const auto tensor_map_d = make_tma_cd_desc(d, m, n,
                                                config.storage_config.store_block_m,
                                                config.storage_config.store_block_n,
@@ -1378,6 +1416,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         sfb.scalar_type() == torch::kBFloat16;
     const bool g128_scale_b_l2_prefetch =
         gran_k_b == 128 and scale_b_direct_load and scale_b_bf16 and
+        not g128_scale_b_stage_tma and
         env_int("DG_W4_G128_SFB_PREFETCH", 1) != 0;
     // E8M0 SFB（仅 path-B fast-path）：每元素 1B = fp32 的 8 位指数，体积再砍 2x。
     // 解码 `__uint_as_float(uint32(e) << 23)` 零误差。**默认开启**：当用户传入
@@ -1424,6 +1463,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .reorder_masked_by_max_m = reorder_masked_by_max_m,
         .g128_fast_partial_store = g128_fast_partial_store,
         .g128_scale_b_l2_prefetch = g128_scale_b_l2_prefetch,
+        .g128_scale_b_stage_tma = g128_scale_b_stage_tma,
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .sfb = sfb.data_ptr(),
@@ -1432,6 +1472,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
     };
     const auto code = SM90FP8FP4Gemm1D2DRSRuntime::generate(rs_args);
     const auto runtime = compiler->build("sm90_m_grouped_fp8_fp4_gemm_masked_1d2d_rs_fused", code);

@@ -91,6 +91,8 @@ public:
         bool g128_fast_partial_store;
         // Issued by the elected TMA producer.
         bool g128_scale_b_l2_prefetch;
+        // Stage BF16 SFB with TMA and make it part of the A/B/SFA full barrier.
+        bool g128_scale_b_stage_tma;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -99,6 +101,7 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
         CUtensorMap tensor_map_sfa;
+        CUtensorMap tensor_map_sfb;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -118,6 +121,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -272,14 +276,16 @@ static void __instantiate_kernel() {{
         args.scale_b_e8m0 ? "true" : "false",
         args.reorder_masked_by_max_m ? "true" : "false",
         args.g128_fast_partial_store ? "true" : "false",
-        args.g128_scale_b_l2_prefetch ? "true" : "false");
+        args.g128_scale_b_l2_prefetch ? "true" : "false",
+        args.g128_scale_b_stage_tma ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.gmem_b_ptr, args.sfb, args.grouped_layout, args.gmem_d_ptr,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.tensor_map_a, args.tensor_map_b, args.tensor_map_d, args.tensor_map_sfa));
+            args.tensor_map_a, args.tensor_map_b, args.tensor_map_d,
+            args.tensor_map_sfa, args.tensor_map_sfb));
     }
 };
 

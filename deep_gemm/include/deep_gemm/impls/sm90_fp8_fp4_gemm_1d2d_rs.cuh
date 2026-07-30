@@ -692,7 +692,8 @@ template <cute::UMMA::Major kMajorSFB,
           bool kScaleBE8M0 = false,
           bool kReorderMaskedByMaxM = false,
           bool kFastPartialMaskedStore = false,
-          bool kScaleBL2Prefetch = false>
+          bool kScaleBL2Prefetch = false,
+          bool kScaleBStageTMA = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -700,7 +701,8 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                             const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfb) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -720,6 +722,10 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      (kScaleBDirectLoad and kScaleBGranK == 128 and kScaleBBF16 and
                       kMajorSFB == cute::UMMA::Major::MN),
                      "Scale-B prefetch only supports group128 BF16 MN-major direct-load");
+    DG_STATIC_ASSERT(not kScaleBStageTMA or
+                     (kScaleBDirectLoad and kScaleBGranK == 128 and kScaleBBF16 and
+                      kMajorSFB == cute::UMMA::Major::MN and not kScaleBL2Prefetch),
+                     "Scale-B stage TMA only supports group128 BF16 MN-major direct-load");
     DG_STATIC_ASSERT(not kScaleBE8M0 or (kScaleBDirectLoad and kScaleBGranK == 32),
                      "E8M0 Scale-B is only supported by direct-load per-32 path");
     DG_STATIC_ASSERT(not kScaleBBF16 or kScaleBGranK == 128 or
@@ -758,6 +764,10 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
         (BLOCK_M < WGMMA::M ? WGMMA::M : BLOCK_M) * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
+    static constexpr uint32_t SMEM_SFB_TMA_SIZE_PER_STAGE =
+        kScaleBStageTMA ? BLOCK_N * sizeof(nv_bfloat16) : 0u;
+    static constexpr uint32_t ALIGNED_SMEM_SFB_TMA_SIZE_PER_STAGE =
+        math::constexpr_align(SMEM_SFB_TMA_SIZE_PER_STAGE, 128u);
     static constexpr uint32_t SCALE_B_ELEMENT_SIZE =
         kScaleBE8M0 ? static_cast<uint32_t>(sizeof(uint8_t)) :
         (kScaleBBF16 ? static_cast<uint32_t>(sizeof(nv_bfloat16)) :
@@ -771,7 +781,7 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
         math::align<uint32_t>((BLOCK_K / kScaleBGranK) *
                               (kFuseScaleBDecode ? math::ceil_div(BLOCK_N, 4u) : BLOCK_N) *
                               sizeof(float), 16u) :
-        (kScaleBDirectLoad ? 0u :
+        ((kScaleBDirectLoad or kScaleBStageTMA) ? 0u :
          math::align<uint32_t>(shape_k_scales_b * BLOCK_N * sizeof(float), 16u));
     // NOTES: Make sure we have enough shared memory for WGMMA padding
     static constexpr uint32_t WGMMA_A_SIZE_PER_STAGE = WGMMA::M * BLOCK_K * sizeof(__nv_fp8_e4m3);
@@ -798,6 +808,8 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
+        if constexpr (kScaleBStageTMA)
+            cute::prefetch_tma_descriptor(&tensor_map_sfb);
         cute::prefetch_tma_descriptor(&tensor_map_d);
     }
     __syncwarp();
@@ -818,7 +830,14 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     });
-    constexpr uint32_t SMEM_SFB_OFFSET = SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE;
+    constexpr uint32_t SMEM_SFB_TMA_OFFSET =
+        SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE;
+    auto smem_sfb_tma = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<nv_bfloat16*>(
+            smem_buffer + SMEM_SFB_TMA_OFFSET + i * ALIGNED_SMEM_SFB_TMA_SIZE_PER_STAGE);
+    });
+    constexpr uint32_t SMEM_SFB_OFFSET =
+        SMEM_SFB_TMA_OFFSET + kNumStages * ALIGNED_SMEM_SFB_TMA_SIZE_PER_STAGE;
     // Prefer aliasing SFB onto smem_d. Small-M tiles usually have too little
     // smem_d, and SHAPE_K can be runtime-only, so choose the separate SFB region
     // dynamically to match the host-side smem_size calculation.
@@ -952,6 +971,15 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                  num_tma_multicast_b, batch_idx);
                     }
 
+                    if constexpr (kScaleBStageTMA) {
+                        const uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
+                        const uint32_t sfb_k_idx =
+                            get_current_group_idx() * shape_k_scales_b + k_block_idx;
+                        tma::copy<BLOCK_N, 1, 0>(
+                            &tensor_map_sfb, &full_barrier, smem_sfb_tma[stage_idx],
+                            sfb_n_idx, sfb_k_idx, num_tma_multicast_b);
+                    }
+
                     if constexpr (kScaleBL2Prefetch) {
                         const uint32_t n_base = n_block_idx * BLOCK_N;
                         const uint32_t valid_n = min(BLOCK_N, shape_n - n_base);
@@ -970,7 +998,8 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
 
                     constexpr uint32_t kExpectedTxBytes = SMEM_A_TMA_SIZE_PER_STAGE +
                                                           (kWeightStub ? 0 : SMEM_B_PACKED_SIZE_PER_STAGE) +
-                                                          (kScaleAStub ? 0 : SMEM_SFA_TMA_SIZE_PER_STAGE);
+                                                          (kScaleAStub ? 0 : SMEM_SFA_TMA_SIZE_PER_STAGE) +
+                                                          SMEM_SFB_TMA_SIZE_PER_STAGE;
                     full_barrier.arrive_and_expect_tx(kExpectedTxBytes);
                 }
             }
@@ -1208,7 +1237,10 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
             auto load_sfb = [&](uint32_t n_idx, uint32_t k_block_idx) {
                 if (n_idx >= shape_n)
                     return 1.0f;
-                if constexpr (kScaleBDirectLoad) {
+                if constexpr (kScaleBStageTMA) {
+                    const uint32_t n_off = n_idx - n_block_idx * BLOCK_N;
+                    return __bfloat162float(smem_sfb_tma[stage_idx][n_off]);
+                } else if constexpr (kScaleBDirectLoad) {
                     if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
                         const uint32_t offset =
                             current_group_idx * aligned_shape_n_sfb * shape_k_scales_b +
