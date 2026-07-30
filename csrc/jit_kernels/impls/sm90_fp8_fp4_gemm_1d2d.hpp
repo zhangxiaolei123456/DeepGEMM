@@ -653,11 +653,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         sfb.scalar_type() == torch::kBFloat16 and
         not env_disabled("DG_W4_SCALE_B_BF16") and
         env_int("DG_W4_G128_BF16_DIRECT_LOAD", 1) != 0;
-    const bool g128_scale_b_stage_tma_requested =
+    const bool g128_scale_b_stage_tma =
         g128_bf16_direct_load and
         get_major_type_ab(sfb) == cute::UMMA::Major::MN and
         env_int("DG_W4_G128_SFB_TMA", 1) != 0;
-    bool g128_scale_b_stage_tma = false;
     const bool g128_fast_partial_store =
         g128_bf16_direct_load and env_int("DG_W4_G128_FAST_PARTIAL_STORE", 1) != 0;
     // BM=64 fast-path 是否启用（函数作用域统一判据，供三处共用：layout 选择 /
@@ -713,8 +712,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             const int smem_sfa_per_stage =
                 align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
             const int packed_per_stage = bn * (block_k / 2);
+            const int sfb_tma_per_stage = g128_scale_b_stage_tma ?
+                align(bn * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
             const int merged_per_stage =
-                smem_a_per_stage + smem_sfa_per_stage + packed_per_stage;
+                smem_a_per_stage + smem_sfa_per_stage + packed_per_stage + sfb_tma_per_stage;
             constexpr int kMaxEvaluatedStages = 10;
             constexpr int kBarrierBytes = 16 * kMaxEvaluatedStages * 2;
             const int fixed = smem_d_bytes + kBarrierBytes + sfb_extra;
@@ -1129,10 +1130,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const int smem_a_per_stage = rs_padded_bm * block_k * static_cast<int>(c10::elementSize(desc.a_dtype));
         const int smem_sfa_per_stage =
             align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
+        const int sfb_tma_per_stage = g128_scale_b_stage_tma ?
+            align(block_n * static_cast<int>(sizeof(nv_bfloat16)), 128) : 0;
         const int merged_per_stage =
-            smem_a_per_stage + smem_sfa_per_stage + packed_per_stage;
-        const int sfb_tma_per_stage = align(
-            block_n * static_cast<int>(sizeof(nv_bfloat16)), 128);
+            smem_a_per_stage + smem_sfa_per_stage + packed_per_stage + sfb_tma_per_stage;
         const int orig_num_stages = config.pipeline_config.num_stages;
         const int smem_extra =
             config.pipeline_config.smem_size - orig_num_stages * original_per_stage + smem_d_extra + sfb_extra;
@@ -1185,15 +1186,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             chosen_stages = kW4DefaultMaxStages;
         }
         DG_HOST_ASSERT(chosen_stages >= 3);
-        const bool use_stage_tma =
-            g128_scale_b_stage_tma_requested and
-            smem_extra + chosen_stages * (merged_per_stage + sfb_tma_per_stage) <=
-                SM90ArchSpec::smem_capacity;
-        g128_scale_b_stage_tma = use_stage_tma;
         config.pipeline_config.num_stages = chosen_stages;
-        config.pipeline_config.smem_size =
-            smem_extra + chosen_stages *
-                (merged_per_stage + (use_stage_tma ? sfb_tma_per_stage : 0));
+        config.pipeline_config.smem_size = smem_extra + chosen_stages * merged_per_stage;
     }
 
     // R2b-A swap_ab maps original N onto WGMMA M. Use enough math warpgroups
