@@ -1095,6 +1095,22 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         layout.cluster_m = 1;
         config = rebuild_config(layout);
     }
+    // Pair adjacent masked M tiles so packed-B and staged SFB use one TMA
+    // multicast. Even N-block counts keep every persistent cluster within
+    // the same expert; odd M tails already fall back to single-CTA TMA.
+    const bool g128_cluster_m =
+        gran_k_b == 128 and
+        g128_scale_b_stage_tma and
+        not masked_m_max_hint.has_value() and
+        env_int("DG_W4_G128_CLUSTER_M", 0) != 0 and
+        desc.num_sms % 2 == 0 and
+        config.layout.cluster_n == 1 and
+        ceil_div(static_cast<int>(n), config.layout.block_n) % 2 == 0;
+    if (g128_cluster_m) {
+        auto layout = config.layout;
+        layout.cluster_m = 2;
+        config = rebuild_config(layout);
+    }
     // Packed FP4 B has half the K bytes of FP8 B. Match PR #287's W4 path:
     // TMA writes B with a 64B swizzle and the RS kernel reads it via ldmatrix.
     config.storage_config.swizzle_b_mode = config.layout.block_k / 2;
@@ -1204,11 +1220,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     if (g128_bf16_direct_load and env_int("DG_W4_G128_PRINT_CONFIG", 0) != 0) {
         printf(
             "[g128-config] stage_tma=%d block_m=%d block_n=%d block_k=%d "
-            "num_stages=%d smem_bytes=%d threads=%d\n",
+            "cluster_m=%d num_stages=%d smem_bytes=%d threads=%d\n",
             static_cast<int>(g128_scale_b_stage_tma),
             config.layout.block_m,
             config.layout.block_n,
             config.layout.block_k,
+            config.layout.cluster_m,
             config.pipeline_config.num_stages,
             config.pipeline_config.smem_size,
             config.launch_config.num_threads);
