@@ -698,18 +698,26 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     // 参数空间：BM ∈ {8, 16, 32, 64, 128}（BM<64 用于 masked small-M），
     //          BN ∈ {64, 128, 256}。
     //
-    // 选择目标：在 (waves <= ceil_div(total_tiles, num_sms)) 的前提下最大化 stages，
-    //         其次最大化 last_wave 利用率，最后倾向更小的 per-stage（即更小 BN）。
+    // 选择目标：先保证足够的 TMA stages，再最小化 padded-M 计算和每个 M tile
+    // 重复执行的 FP4 decode/B-load/control 开销；其后减少 waves、提高
+    // last-wave 利用率，并倾向更小的 per-stage shared memory。
     if (not block_m_override and not block_n_override) {
         const int num_sms = desc.num_sms;
         const int block_k = layout.block_k;
         const int shape_k_scales_b = ceil_div(static_cast<int>(k), gran_k_b);
 
-        auto eval_layout = [&](int bm, int bn) -> std::tuple<int, int, int, int> {
-            // 返回 (sat_stages, -waves, last_wave_util, -per_stage)，越大越好。
+        auto eval_layout = [&](int bm, int bn) -> std::tuple<int, int, int, int, int> {
+            // 返回 (sat_stages, -estimated_m_work, -waves, last_wave_util,
+            // -per_stage)，越大越好。每个 M tile 增加等价 8 行计算的固定成本，
+            // 近似重复的 packed-B load、FP4 decode 和 K-loop 控制指令。
             // stages 在 ~6 之上对 TMA 隐藏几乎饱和，因此用饱和 stage 数比较，避免
             // 小 BN 因 stages=8 击败 wave 利用率更高的候选。
-            const int tiles = ceil_div(expected_m, bm) * ceil_div(static_cast<int>(n), bn) * num_groups;
+            const int m_tiles = ceil_div(expected_m, bm);
+            const int padded_m = m_tiles * bm;
+            constexpr int kMBlockOverheadRows = 8;
+            const int estimated_m_work =
+                padded_m + m_tiles * kMBlockOverheadRows;
+            const int tiles = m_tiles * ceil_div(static_cast<int>(n), bn) * num_groups;
             const int waves = ceil_div(tiles, num_sms);
             const int last = tiles - (waves - 1) * num_sms;
             const int last_util = last <= 0 ? num_sms : last;
@@ -739,19 +747,30 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             const int max_stages = (SM90ArchSpec::smem_capacity - fixed) / merged_per_stage;
             constexpr int kStageSaturation = 6;
             const int sat_stages = std::min(std::min(max_stages, kMaxEvaluatedStages), kStageSaturation);
-            return std::make_tuple(sat_stages, -waves, last_util, -merged_per_stage);
+            return std::make_tuple(
+                sat_stages, -estimated_m_work, -waves, last_util,
+                -merged_per_stage);
         };
 
-        std::vector<std::pair<int, int>> w4_candidates = {
-            {64, 64}, {64, 128}, {64, 256},
-            {128, 64}, {128, 128},
-        };
-        if (expected_m <= 32) {
-            w4_candidates.insert(w4_candidates.begin(), {{8, 64}, {16, 64}, {32, 64}});
+        std::vector<std::pair<int, int>> w4_candidates;
+        if (gran_k_b == 128) {
+            for (const int bm : {8, 16, 32, 64, 128}) {
+                for (const int bn : {64, 128, 256})
+                    w4_candidates.emplace_back(bm, bn);
+            }
+        } else {
+            w4_candidates = {
+                {64, 64}, {64, 128}, {64, 256},
+                {128, 64}, {128, 128},
+            };
+            if (expected_m <= 32) {
+                w4_candidates.insert(
+                    w4_candidates.begin(), {{8, 64}, {16, 64}, {32, 64}});
+            }
         }
 
         std::pair<int, int> best{layout.block_m, layout.block_n};
-        std::tuple<int, int, int, int> best_score{-1, 0, 0, 0};
+        std::tuple<int, int, int, int, int> best_score{-1, 0, 0, 0, 0};
         bool first = true;
         for (const auto& cand : w4_candidates) {
             const int bm = cand.first;
@@ -1038,38 +1057,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                     else if (bm_select_m <= 32) layout.block_m = 32;
                     else if (bm_select_m <= 64) layout.block_m = 64;
                     layout.block_n = 256;
-                }
-            } else {
-                // path-A (gran_k_b=128): BF16 SFB direct-load by default.
-                // Without caller hints, use expected_m buckets by default:
-                //   expected_m <= 8  -> BM8
-                //   expected_m <= 16 -> BM16
-                //   expected_m <= 32 -> BM32
-                // Set DG_W4_G128_NOHINT_BUCKET=0 to force no-hint calls to
-                // BM8+BN256 for A/B testing against the bucket policy.
-                // BM=32 uses BN=128 to halve the two-wave final-accum footprint
-                // and reduce register pressure; set DG_W4_G128_BM32_BN128=0 to
-                // restore BN=256.
-                // BLOCK_K is fixed at 128 by the device kernel.
-                const bool g128_nohint_bucket =
-                    masked_m_max_hint.has_value() or
-                    env_int("DG_W4_G128_NOHINT_BUCKET", 1) != 0;
-                const int g128_select_m = g128_nohint_bucket ? bm_select_m : 8;
-                if (g128_select_m <= 8) layout.block_m = 8;
-                else if (g128_select_m <= 16) layout.block_m = 16;
-                else if (g128_select_m <= 32) layout.block_m = 32;
-                else if (g128_select_m <= 64) layout.block_m = 64;
-                layout.block_n = 256;
-
-                // DSV4 + small hot (bm_select∈(32,64])：BM=64 padding 浪费太大，
-                // 改 BM=32；gran_k_b=128 仍保持 BN=256。
-                if (bm_select_m > 32 and bm_select_m <= 64 and dsv4_shape and
-                    env_int("DG_W4_SMALL_HOT_BM32", 1) != 0) {
-                    layout.block_m = 32;
-                }
-                if (layout.block_m == 32 and
-                    env_int("DG_W4_G128_BM32_BN128", 1) != 0) {
-                    layout.block_n = 128;
                 }
             }
             // 历史经验注记：
