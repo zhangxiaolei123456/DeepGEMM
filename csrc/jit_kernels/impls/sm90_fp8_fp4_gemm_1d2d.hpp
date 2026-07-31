@@ -659,7 +659,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         env_int("DG_W4_G128_SFB_TMA", 1) != 0;
     const bool g128_scale_b_stage_tma_alias_a_enabled =
         g128_scale_b_stage_tma and
-        env_int("DG_W4_G128_SFB_TMA_ALIAS_A", 0) != 0;
+        env_int("DG_W4_G128_SFB_TMA_ALIAS_A", 1) != 0;
     auto can_alias_g128_scale_b_stage_tma_in_a = [&](const Layout& candidate) {
         if (not g128_scale_b_stage_tma_alias_a_enabled)
             return false;
